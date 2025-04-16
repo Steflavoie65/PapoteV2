@@ -30,8 +30,34 @@ yarn-error.*
 
 # local env files
 .env*.local
+.env
 
 # typescript
 *.tsbuildinfo
 
 app-example
+
+# security
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.cert
+*.secret
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Build
+/build
+/dist
+/.next
