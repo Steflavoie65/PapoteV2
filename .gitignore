@@ -40,6 +40,8 @@ app-example
 # security
 .env
 .env.local
+.env
+.env.local
 .env.*.local
 *.key
 *.pem
