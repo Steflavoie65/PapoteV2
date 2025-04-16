@@ -1,0 +1,47 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Règle générale pour l'authentification
+    match /{document=**} {
+      allow read, write: if true;  // Temporairement pour les tests
+    }
+
+    // Règles pour la collection seniors
+    match /seniors/{seniorId} {
+      allow read, write: if true;
+    }
+
+    // Règles pour la collection connectionRequests
+    match /connectionRequests/{requestId} {
+      allow read, write: if true;
+    }
+
+    // Règles pour la collection families
+    match /families/{familyId} {
+      allow read, write: if true;
+    }
+
+    // Règles pour la collection users et ses sous-collections
+    match /users/{userId} {
+      allow read, write: if true;  // Temporairement pour les tests
+      
+      match /profile/{document=**} {
+        allow read, write: if true;
+      }
+      
+      match /roles/{document=**} {
+        allow read, write: if true;
+      }
+    }
+
+    // Règles pour la collection connections
+    match /connections/{connectionId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // Règles pour la collection families
+    match /users/{userId} {
+      allow read, write: if request.auth != null && resource.data.userType == 'family';
+    }
+  }
+}

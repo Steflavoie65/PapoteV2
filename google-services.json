@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "248711081717",
+    "project_id": "proxytask-dev",
+    "storage_bucket": "proxytask-dev.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:248711081717:android:77ad7cb86b4d50f5a15fbc",
+        "android_client_info": {
+          "package_name": "com.proxytask.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCrKb6lKsMCpUwEFc0G7WIVEt3GZ94sp2o"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
