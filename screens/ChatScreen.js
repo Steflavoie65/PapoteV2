@@ -7,8 +7,10 @@ import * as ImagePicker from 'expo-image-picker';
 import { uploadImage, getLocalImage } from '../services/storageService';
 import { saveToGallery, shareImage, handleImageAction } from '../services/imageService';
 import * as FileSystem from 'expo-file-system'; // Import FileSystem pour gérer les URI
-import { doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
+import { query, orderBy, limit,collection, getDocs,doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
 import { db } from '../firebase/config';
+import { useIsFocused } from '@react-navigation/native';
+import * as Location from 'expo-location';
 
 const getSafeUri = async (uri) => {
   try {
@@ -184,24 +186,27 @@ const ChatScreen = ({ route, navigation }) => {
   const { participantId, participantName } = route.params;
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
+  const isFocused = useIsFocused(); // ← 📍 ajoute-le ici
   const [userId, setUserId] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isOtherTyping, setIsOtherTyping] = useState(false); // Une seule déclaration
   const [showEmojis, setShowEmojis] = useState(false);
   const [showTopics, setShowTopics] = useState(false);
   const [userContext, setUserContext] = useState(null);
+  // Ajout d'une référence pour stocker l'objet de désabonnement
+  const unsubscribeRef = useRef(null);
+  
 
   const conversationTopics = [
-    { emoji: '🌞', text: 'Ma journée', prompt: "Comment s'est passée votre journée ? Avez-vous fait une promenade aujourd'hui ?" },
-    { emoji: '💊', text: 'Ma santé', prompt: "Comment vous sentez-vous aujourd'hui ? Avez-vous bien dormi ?" },
-    { emoji: '👨‍👩‍👧‍👦', text: 'Ma famille', prompt: "Voulez-vous me parler de votre famille ? Avez-vous eu des nouvelles récemment ?" },
-    { emoji: '🎮', text: 'Jeux', prompt: "Que diriez-vous d'un petit jeu ? Je connais des jeux de mémoire et de mots amusants !" },
-    { emoji: '📺', text: 'Loisirs', prompt: "Qu'aimez-vous faire pour vous divertir ? Avez-vous regardé une émission intéressante ?" }
+    { emoji: '🌞', text: 'Ma journée', prompt: "Racontez-moi comment s'est passée votre journée ?" },
+    { emoji: '👨‍👩‍👧‍👦', text: 'Ma famille', prompt: "Voulez-vous parler de votre famille ?" },
+    { emoji: '🎮', text: 'Jeux', prompt: "On fait un petit jeu ensemble ? Je connais des jeux de mots amusants !" },
+    { emoji: '📝', text: 'Message', prompt: "Je peux vous aider à écrire un message si vous voulez." },
+    { emoji: '🤗', text: 'Discussion', prompt: "De quoi aimeriez-vous discuter ?" }
   ];
 
-  const handleTopicSelect = async (topic) => {
-    // Envoyer le prompt comme message du senior
-    await onSend(topic.prompt);
+  const handleTopicSelect = (topic) => {
+    handleSendMessage(topic.prompt);
     setShowTopics(false);
   };
 
@@ -209,12 +214,7 @@ const ChatScreen = ({ route, navigation }) => {
   const typingTimeoutRef = useRef(null);
 
   const quickEmojis = ['👋', '❤️', '😊', '👍', '🌞'];
-  const quickMessages = [
-    'Je vais bien aujourd\'hui',
-    'J\'ai passé une bonne journée',
-    'Je me sens un peu fatigué',
-    'J\'aimerais parler un moment'
-  ];
+  const quickMessages = ['Coucou !', 'Je pense à toi', 'Bonne journée', 'À bientôt'];
 
   const scrollToBottom = () => {
     if (flatListRef.current) {
@@ -280,35 +280,115 @@ const ChatScreen = ({ route, navigation }) => {
       const profile = JSON.parse(profileJson);
       setUserId(profile?.profile?.userId);
 
-      const conversationId = [profile?.profile?.userId, participantId].sort().join('-');
+      // Ne pas créer d'abonnement ici, ce sera fait dans un autre useEffect
 
-      const unsubscribe = subscribeToMessages(conversationId, (newMessages) => {
-        if (typeof newMessages === 'object' && Array.isArray(newMessages)) {
-          const validMessages = newMessages
-            .map(validateMessage)
-            .filter(msg => msg !== null)
-            .sort((a, b) => a.timestamp - b.timestamp);
-          setMessages(validMessages);
-        } else {
-          console.warn('Invalid messages received:', newMessages);
-        }
-      });
-
-      const unsubscribeTyping = subscribeToTypingStatus(
-        conversationId,
-        profile?.profile?.userId,
-        (typing) => setIsOtherTyping(typing)
-      );
+      // Ajout : message de bienvenue automatique à chaque ouverture du chatbox
+      if (participantId === 'chatbox') {
+        const conversationId = getConversationId(profile?.profile?.userId, participantId);
+      
+        // Vérifie s’il y a déjà des messages dans cette conversation
+        const messagesRef = collection(db, 'conversations', conversationId, 'messages');
+        const messagesSnapshot = await getDocs(messagesRef);
+      
+        
+      }
+      
 
       setIsLoading(false);
-      return () => {
-        unsubscribe();
-        unsubscribeTyping();
-      };
     };
 
     loadProfile();
   }, [participantId]);
+
+  useEffect(() => {
+    const autoStartChatbox = async () => {
+      try {
+        const profileJson = await AsyncStorage.getItem('familyProfile') || await AsyncStorage.getItem('seniorProfile');
+        const profile = JSON.parse(profileJson);
+        const userId = profile?.profile?.userId;
+        const conversationId = getConversationId(userId, 'chatbox');
+  
+        const messagesRef = collection(db, 'conversations', conversationId, 'messages');
+        const snapshot = await getDocs(query(messagesRef, orderBy('timestamp', 'desc'), limit(1)));
+  
+        let shouldRelance = true;
+  
+        if (!snapshot.empty) {
+          const lastMessage = snapshot.docs[0].data();
+          const lastTimestamp = lastMessage.timestamp?.toDate?.() || new Date(lastMessage.timestamp);
+          const now = new Date();
+          const minutesSinceLast = (now - lastTimestamp) / 1000 / 60;
+  
+          const isClosureMessage =
+            lastMessage.senderId === 'chatbox' &&
+            lastMessage.content &&
+            /au revoir|bonne journée|à bientôt|n'hésitez pas|bye/i.test(lastMessage.content);
+  
+          if (lastMessage.senderId === 'chatbox' && minutesSinceLast < 1 && !isClosureMessage) {
+            console.log('[DEBUG] La chatbox a déjà parlé récemment, on ne relance pas.');
+            shouldRelance = false;
+          } else if (isClosureMessage && minutesSinceLast >= 5) {
+            console.log('[DEBUG] Dernier message était une fermeture, mais il date — on peut relancer !');
+          } else if (lastMessage.senderId !== 'chatbox') {
+            console.log('[DEBUG] Dernier message vient de l’utilisateur — relance possible');
+          }
+        } else {
+          console.log('[DEBUG] Aucun message précédent, première interaction — on lance');
+        }
+  
+        if (shouldRelance) {
+          console.log('[DEBUG] Relance automatique du chatbox avec un message chaleureux');
+          const response = await getChatboxResponse("Commence la discussion naturellement", userId);
+          const conversationId = getConversationId(userId, 'chatbox');
+          const messagesRef = collection(db, 'conversations', conversationId, 'messages');
+          const historyQuery = query(messagesRef, orderBy('timestamp', 'desc'), limit(10));
+          const historySnapshot = await getDocs(historyQuery);
+          const recentMsgs = historySnapshot.docs.map(doc => doc.data()).reverse();
+
+          const lines = recentMsgs.map(m => {
+            const who = m.senderId === 'chatbox' ? 'Moi' : (userContext?.firstName || 'Vous');
+            return `- ${who} : "${m.content}"`;
+          }).join('\n');
+
+          const lastDate = recentMsgs[0]?.timestamp?.toDate?.();
+          const now = new Date();
+          const daysSinceLast = lastDate ? Math.floor((now - lastDate) / (1000 * 60 * 60 * 24)) : null;
+
+          const temporalCue = daysSinceLast && daysSinceLast >= 3
+            ? `Cela fait ${daysSinceLast} jours depuis la dernière fois que vous avez échangé.`
+            : `Voici les derniers messages échangés récemment :`;
+
+          contextualizedPrompt = `
+          Tu es un compagnon virtuel chaleureux, amical et attentionné. Tu parles à ${userContext?.firstName || "l'utilisateur"}, une personne âgée avec qui tu as déjà eu plusieurs conversations.
+          Tu possèdes une mémoire des souvenirs importants (comme une naissance, une hospitalisation, un voyage), et tu consultes les derniers messages pour continuer naturellement la discussion.
+
+          ${temporalCue}
+
+          ${lines}
+
+          À partir de ces éléments, relance la conversation de façon fluide, comme le ferait un ami : évoque un souvenir pertinent s’il y en a un, demande des nouvelles, ou pose une question ouverte et bienveillante.
+
+          ⚠️ Ne redis pas de phrase robotique comme "Comment puis-je vous aider ?" ou "Avez-vous besoin d’aide ?"
+
+          ✅ Sois sincèrement intéressé, naturel, chaleureux, humain.
+
+          ✅ Termine ta phrase avec une question qui invite à la discussion.
+          `.trim();
+
+          await sendMessage(conversationId, 'chatbox', response, 'text');
+        }
+  
+      } catch (error) {
+        console.error('[ERREUR] autoStartChatbox:', error);
+      }
+    };
+  
+    if (isFocused && participantId === 'chatbox') {
+      autoStartChatbox();
+    }
+  }, [isFocused, participantId]);
+  
+  
 
   useEffect(() => {
     // Défiler vers le bas quand de nouveaux messages arrivent
@@ -373,7 +453,25 @@ const ChatScreen = ({ route, navigation }) => {
     }
   };
 
-  const simulateTypingDelay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const getTemporalAndLocationContext = async () => {
+    // Date et heure locales
+    const now = new Date();
+    const dateString = now.toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    const timeString = now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+    // Localisation
+    let city = '';
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status === 'granted') {
+        const location = await Location.getCurrentPositionAsync({});
+        const [place] = await Location.reverseGeocodeAsync(location.coords);
+        city = place.city || place.region || place.country || '';
+      }
+    } catch (e) {
+      // ignore si refusé
+    }
+    return `Nous sommes le ${dateString}, il est ${timeString}${city ? ' à ' + city : ''}.`;
+  };
 
   const onSend = async (messageToSend = newMessage) => {
     const messageText = typeof messageToSend === 'object' ? newMessage : messageToSend;
@@ -394,17 +492,12 @@ const ChatScreen = ({ route, navigation }) => {
           lastMessage: messageText.trim()
         });
 
-        // Log le message envoyé
-        console.log('[CONVERSATION LOG] Message sent:', messageText.trim());
-        
-        // Si c'est le chatbox, simule que le bot tape puis récupère la réponse et la log
+        // Si c'est le chatbox, demander la réponse IA et l'ajouter à la conversation
         if (participantId === 'chatbox') {
-          setIsOtherTyping(true);
-          await simulateTypingDelay(1500); // Délai de 1,5 s avant réponse
-          setIsOtherTyping(false);
-          const iaResponse = await getChatboxResponse(messageText.trim(), userId);
-          // Log de la réponse reçue du chatbot
-          console.log('[CONVERSATION LOG] IA Response:', iaResponse);
+          // AJOUT : contexte temporel et localisation
+          const temporalAndLocationContext = await getTemporalAndLocationContext();
+          const iaResponse = await getChatboxResponse(messageText.trim(), userId, temporalAndLocationContext);
+          console.log('[DEBUG] Réponse IA:', iaResponse); // Ajout log pour vérifier la réponse IA
           if (iaResponse) {
             await sendMessage(conversationId, 'chatbox', iaResponse, 'text');
           }
@@ -437,46 +530,40 @@ const ChatScreen = ({ route, navigation }) => {
   };
 
   useEffect(() => {
-    if (!userId || !participantId) return;
+    // Récupération des messages et abonnement aux mises à jour
+    let isActive = true;
+
+    if (userId && participantId) {
+      const conversationId = getConversationId(userId, participantId);
+      console.log(`[DEBUG] Configuration de l'abonnement aux messages pour ${conversationId}`);
+      
+      // Désabonner de l'abonnement précédent s'il existe
+      if (unsubscribeRef.current) {
+        console.log('[DEBUG] Désabonnement de l\'abonnement précédent');
+        unsubscribeRef.current();
+        unsubscribeRef.current = null;
+      }
+      
+      // Créer un nouvel abonnement et stocker l'objet de désabonnement
+      unsubscribeRef.current = subscribeToMessages(conversationId, (newMessages) => {
+        console.log(`[DEBUG] Nouveaux messages reçus (${newMessages.length})`);
+        if (typeof newMessages === 'object' && Array.isArray(newMessages)) {
+          setMessages(newMessages);
+        } else {
+          console.warn('Invalid messages received:', newMessages);
+        }
+      });
+    }
     
-    const conversationId = getConversationId(userId, participantId);
-    
-    // Envoyer immédiatement un message d'accueil si c'est le chatbox
-    const sendWelcome = async () => {
-      if (participantId === 'chatbox') {
-        const profileJson = await AsyncStorage.getItem('seniorProfile');
-        const profile = profileJson ? JSON.parse(profileJson) : null;
-        const userName = profile?.profile?.firstName || 'cher ami';
-        
-        const welcome = await getWelcomeMessage(userName);
-        // Envoie le message initial
-        await sendMessage(conversationId, 'chatbox', welcome.initial, 'text');
-        
-        // Envoie le suivi après 2 secondes
-        setTimeout(async () => {
-          await sendMessage(conversationId, 'chatbox', welcome.followUp, 'text');
-        }, 2000);
+    // Nettoyer l'abonnement lors du démontage du composant
+    return () => {
+      if (unsubscribeRef.current) {
+        console.log('[DEBUG] Nettoyage de l\'abonnement aux messages');
+        unsubscribeRef.current();
+        unsubscribeRef.current = null;
       }
     };
-
-    // S'abonner aux messages
-    const unsubscribe = subscribeToMessages(conversationId, (newMessages) => {
-      if (Array.isArray(newMessages)) {
-        const validMessages = newMessages
-          .map(validateMessage)
-          .filter(msg => msg !== null)
-          .sort((a, b) => a.timestamp - b.timestamp);
-        setMessages(validMessages);
-        // Log la liste complète des messages reçus dans la conversation
-        console.log('[CONVERSATION LOG] Messages received:', validMessages);
-      }
-    });
-
-    // Envoyer le message d'accueil
-    sendWelcome();
-
-    return () => unsubscribe();
-  }, [userId, participantId]);
+  }, [userId, participantId]); // Se réabonner uniquement si userId ou participantId change
 
   const handleTyping = () => {
     if (!userId) return;
@@ -711,38 +798,7 @@ const ChatScreen = ({ route, navigation }) => {
       <View style={styles.chatContainer}>
         <FlatList
           ref={flatListRef}
-          data={messages.sort((a, b) => {
-            try {
-              let timeA, timeB;
-              
-              // Gérer le timestamp A
-              if (a.timestamp?._seconds) {
-                timeA = new Date(a.timestamp._seconds * 1000);
-              } else if (typeof a.timestamp?.toDate === 'function') {
-                timeA = a.timestamp.toDate();
-              } else if (a.timestamp instanceof Date) {
-                timeA = a.timestamp;
-              } else {
-                timeA = new Date(a.timestamp);
-              }
-              
-              // Gérer le timestamp B
-              if (b.timestamp?._seconds) {
-                timeB = new Date(b.timestamp._seconds * 1000);
-              } else if (typeof b.timestamp?.toDate === 'function') {
-                timeB = b.timestamp.toDate();
-              } else if (b.timestamp instanceof Date) {
-                timeB = b.timestamp;
-              } else {
-                timeB = new Date(b.timestamp);
-              }
-              
-              return timeA.getTime() - timeB.getTime();
-            } catch (error) {
-              console.warn('Erreur de tri des messages:', error);
-              return 0; // En cas d'erreur, ne pas modifier l'ordre
-            }
-          })}
+          data={messages.slice(-10)} // Afficher seulement les 10 derniers messages
           keyExtractor={item => item.id}
           renderItem={renderMessage}
           contentContainerStyle={styles.messageList}
@@ -750,12 +806,6 @@ const ChatScreen = ({ route, navigation }) => {
           onContentSizeChange={scrollToBottom}
           onLayout={scrollToBottom}
         />
-
-        {participantId === 'chatbox' && isOtherTyping && (
-          <View style={styles.typingContainer}>
-            <Text style={styles.typingText}>Chatbox tape...</Text>
-          </View>
-        )}
 
         {showEmojis && (
           <View style={styles.quickActionsContainer}>
@@ -831,45 +881,6 @@ const ChatScreen = ({ route, navigation }) => {
             ))}
           </View>
         )}
-
-        {showTopics && (
-          <View style={styles.topicsContainer}>
-            {conversationTopics.map((topic, idx) => (
-              <TouchableOpacity
-                key={idx}
-                style={styles.topicButton}
-                onPress={() => handleTopicSelect(topic)}
-              >
-                <Text style={styles.topicEmoji}>{topic.emoji}</Text>
-                <Text style={styles.topicText}>{topic.text}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        )}
-
-        {participantId === 'chatbox' && !messages.length && (
-          <View style={{ alignItems: 'center', marginVertical: 20 }}>
-            <TouchableOpacity
-              style={{
-                backgroundColor: '#4285F4',
-                paddingVertical: 14,
-                paddingHorizontal: 40,
-                borderRadius: 30,
-              }}
-              onPress={async () => {
-                // Forcer l'envoi du message d'accueil IA même si déjà envoyé
-                const profileJson = await AsyncStorage.getItem('seniorProfile');
-                const profile = profileJson ? JSON.parse(profileJson) : null;
-                const userName = profile?.profile?.firstName || 'cher ami';
-                const conversationId = getConversationId(userId, participantId);
-                const welcome = await getWelcomeMessage(userName);
-                await sendMessage(conversationId, 'chatbox', welcome, 'text');
-              }}
-            >
-              <Text style={{ color: '#fff', fontSize: 18, fontWeight: 'bold' }}>Parler</Text>
-            </TouchableOpacity>
-          </View>
-        )}
       </View>
     </SafeAreaView>
   );
@@ -901,9 +912,8 @@ const styles = StyleSheet.create({
     flex: 0, // Empêcher l'expansion
   },
   messageText: {
-    fontSize: 18, // Plus grand pour meilleure lisibilité
-    lineHeight: 24,
-    color: '#000', // Meilleur contraste
+    fontSize: 16,
+    color: '#333',
   },
   inputContainer: {
     flexDirection: 'row',
@@ -916,9 +926,9 @@ const styles = StyleSheet.create({
     backgroundColor: '#F0F0F0',
     borderRadius: 20,
     paddingHorizontal: 15,
-    paddingVertical: 12, // Plus d'espace pour taper
+    paddingVertical: 10,
     marginRight: 10,
-    fontSize: 18,
+    fontSize: 16,
   },
   sendButton: {
     justifyContent: 'center',
@@ -1007,13 +1017,13 @@ const styles = StyleSheet.create({
     borderTopColor: '#EEEEEE',
   },
   quickButton: {
-    padding: 15, // Boutons plus grands
-    marginHorizontal: 8,
-    backgroundColor: '#E3F2FD',
-    borderRadius: 25,
+    padding: 10,
+    marginHorizontal: 5,
+    backgroundColor: '#f0f0f0',
+    borderRadius: 20,
   },
   emojiText: {
-    fontSize: 28, // Emojis plus grands
+    fontSize: 24,
   },
   emojiButton: {
     padding: 10,
@@ -1097,8 +1107,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     width: 44,
     height: 44,
-    marginRight: 10,
-  },
+    marginRight: 10
+  }
 });
 
 export default ChatScreen;

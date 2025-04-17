@@ -39,26 +39,41 @@ export const sendMessage = async (senderId, receiverId, messageContent, messageT
   }
 };
 
-// Récupérer les messages entre deux utilisateurs
-export const getMessages = async (userId1, userId2, limit = 50) => {
+// Récupérer les messages entre deux utilisateurs - Version simplifiée en attendant la création de l'index
+export const getMessages = async (userId1, userId2, messageLimit = 50) => {
   try {
-    // Créer une requête pour récupérer les messages dans les deux sens
+    // Version simplifiée sans 'in' ni tri pour fonctionner sans index composite
+    console.log("Tentative de récupération des messages avec requête simplifiée");
     const q = query(
       collection(db, 'messages'),
-      where('senderId', 'in', [userId1, userId2]),
-      where('receiverId', 'in', [userId1, userId2]),
-      orderBy('createdAt', 'desc'),
-      limit(limit)
+      where('senderId', '==', userId1),
+      where('receiverId', '==', userId2)
     );
     
-    const querySnapshot = await getDocs(q);
+    const q2 = query(
+      collection(db, 'messages'),
+      where('senderId', '==', userId2),
+      where('receiverId', '==', userId1)
+    );
     
-    // Transformer les résultats en tableau de messages
-    const messages = querySnapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data(),
-      createdAt: doc.data().createdAt?.toDate() // Convertir le timestamp en Date
-    }));
+    const [snapshot1, snapshot2] = await Promise.all([
+      getDocs(q),
+      getDocs(q2)
+    ]);
+    
+    // Fusionner les résultats des deux requêtes
+    const messages = [
+      ...snapshot1.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate()
+      })),
+      ...snapshot2.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate()
+      }))
+    ];
     
     // Marquer les messages non lus comme lus
     const unreadMessages = messages.filter(
@@ -72,10 +87,17 @@ export const getMessages = async (userId1, userId2, limit = 50) => {
       });
     }
     
-    // Trier les messages du plus ancien au plus récent
-    messages.sort((a, b) => a.createdAt - b.createdAt);
+    // Trier manuellement les messages du plus ancien au plus récent
+    messages.sort((a, b) => {
+      if (!a.createdAt) return -1;
+      if (!b.createdAt) return 1;
+      return a.createdAt - b.createdAt;
+    });
     
-    return { success: true, messages };
+    // Limiter le nombre de messages
+    const limitedMessages = messages.slice(-messageLimit);
+    
+    return { success: true, messages: limitedMessages };
   } catch (error) {
     console.error("Erreur de récupération des messages:", error);
     return { success: false, error: error.message };

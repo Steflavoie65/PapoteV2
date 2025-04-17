@@ -1,5 +1,5 @@
-// Corriger le chemin d'importation du fichier temporaire
-import { db, auth } from '../firebase-temp';
+// Utiliser notre instance centralisée au lieu du fichier temporaire
+import { db, auth } from '../utils/Firebase';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Clés pour le stockage local

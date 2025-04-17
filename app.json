@@ -44,6 +44,13 @@
           "savePhotosPermission": "Autoriser Papote à sauvegarder les photos.",
           "isAccessMediaLocationEnabled": true
         }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow Papote to use your location.",
+          "locationWhenInUsePermission": "Allow Papote to use your location while the app is in use."
+        }
       ]
     ]
   }
