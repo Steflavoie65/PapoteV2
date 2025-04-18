@@ -14,6 +14,7 @@ import ChatScreen from '../screens/ChatScreen'; // <-- Importer le nouvel écran
 import SeniorSettingsScreen from '../screens/SeniorSettingsScreen'; // <-- Importer le nouvel écran
 import SeniorProfileScreen from '../screens/SeniorProfileScreen'; // <-- Importer le nouvel écran
 import SeniorOptionsScreen from '../screens/SeniorOptionsScreen'; // <-- Importer le nouvel écran
+import SettingsScreen from '../screens/SettingsScreen'; // <-- Importer le nouvel écran
 // ... imports écrans Famille ...
 import RegisterFamilyScreen from '../screens/RegisterFamilyScreen';
 import FamilyHomeScreen from '../screens/FamilyHomeScreen';
@@ -64,6 +65,14 @@ const AppNavigator = () => {
       <Stack.Screen name="SeniorSettings" component={SeniorSettingsScreen} options={{ title: 'Paramètres Senior' }} />
       <Stack.Screen name="SeniorAccount" component={SeniorProfileScreen} options={{ title: 'Mon Compte Senior' }} />
       <Stack.Screen name="SeniorOptions" component={SeniorOptionsScreen} options={{ title: 'Options Senior' }} />
+      <Stack.Screen 
+        name="Settings" 
+        component={SettingsScreen} 
+        options={{ 
+          title: 'Paramètres',
+          headerShown: true 
+        }} 
+      />
 
 
       {/* Flux Famille */}

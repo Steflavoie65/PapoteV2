@@ -4,8 +4,9 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { StyleSheet } from 'react-native';
 
+import { app, db, auth } from './firebase/config';
+
 import { AuthProvider } from './contexts/AuthContext';
-import { auth } from './firebase/config';
 import { onAuthStateChanged } from 'firebase/auth';
 import ContactDetailScreen from './screens/ContactDetailScreen';
 import SeniorDetailScreen from './screens/SeniorDetailScreen';

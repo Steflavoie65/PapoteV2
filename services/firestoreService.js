@@ -2,6 +2,163 @@ import { doc, setDoc, getDoc, updateDoc, deleteDoc, collection, query, where, ge
 import { db } from '../firebase/config';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+/**
+ * Gestion robuste des erreurs Firestore avec fallback vers AsyncStorage
+ */
+export const safeFirestoreOperation = async (operation, fallbackKey, fallbackData = null) => {
+  try {
+    return await operation();
+  } catch (error) {
+    console.error(`[ERREUR FIRESTORE] ${error.message}`);
+    
+    // Vérifier si l'erreur est due à un dépassement de quota
+    if (error.message.includes('quota') || error.code === 'resource-exhausted') {
+      console.warn('[AVERTISSEMENT] Quota Firestore dépassé, utilisation du stockage local');
+      
+      // En cas de lecture, essayer de récupérer depuis AsyncStorage
+      if (fallbackKey) {
+        try {
+          const cachedData = await AsyncStorage.getItem(fallbackKey);
+          if (cachedData) {
+            return JSON.parse(cachedData);
+          }
+        } catch (storageError) {
+          console.error('[ERREUR] Échec du fallback AsyncStorage:', storageError);
+        }
+      }
+      
+      // Retourner les données de secours ou un objet vide
+      return fallbackData || { quotaExceeded: true };
+    }
+    
+    // Autres types d'erreurs
+    throw error;
+  }
+};
+
+/**
+ * Wrapper pour les opérations de lecture Firestore avec gestion de quota
+ */
+export const safeGetDoc = async (docRef, fallbackKey = null) => {
+  return safeFirestoreOperation(
+    async () => {
+      const snapshot = await getDoc(docRef);
+      const data = snapshot.exists() ? snapshot.data() : null;
+      
+      // Mettre en cache les données récupérées pour usage hors ligne
+      if (data && fallbackKey) {
+        await AsyncStorage.setItem(fallbackKey, JSON.stringify(data));
+      }
+      
+      return data;
+    },
+    fallbackKey
+  );
+};
+
+/**
+ * Wrapper pour les opérations d'écriture Firestore avec gestion de quota
+ */
+export const safeSetDoc = async (docRef, data, options = {}, fallbackKey = null) => {
+  return safeFirestoreOperation(
+    async () => {
+      const result = await setDoc(docRef, data, options);
+      
+      // Mettre en cache les données pour synchronisation ultérieure
+      if (fallbackKey) {
+        await AsyncStorage.setItem(fallbackKey, JSON.stringify(data));
+        
+        // Enregistrer l'opération en attente pour synchronisation
+        const pendingOps = JSON.parse(await AsyncStorage.getItem('pendingFirestoreOps') || '[]');
+        pendingOps.push({
+          type: 'setDoc',
+          path: docRef.path,
+          data,
+          options,
+          timestamp: Date.now()
+        });
+        await AsyncStorage.setItem('pendingFirestoreOps', JSON.stringify(pendingOps));
+      }
+      
+      return result;
+    },
+    fallbackKey,
+    data
+  );
+};
+
+/**
+ * Synchroniser les opérations en attente lorsque Firestore est à nouveau disponible
+ */
+export const syncPendingOperations = async () => {
+  try {
+    const pendingOps = JSON.parse(await AsyncStorage.getItem('pendingFirestoreOps') || '[]');
+    if (pendingOps.length === 0) return;
+    
+    console.log(`[INFO] Tentative de synchronisation de ${pendingOps.length} opérations en attente`);
+    
+    // Tester si Firestore est disponible
+    const testDocRef = doc(db, 'system', 'status');
+    await getDoc(testDocRef);
+    
+    // Si on arrive ici, Firestore est disponible
+    for (const op of pendingOps) {
+      try {
+        if (op.type === 'setDoc') {
+          const docRef = doc(db, op.path);
+          await setDoc(docRef, op.data, op.options);
+          console.log(`[INFO] Opération synchronisée: ${op.path}`);
+        }
+        // Ajouter d'autres types d'opérations si nécessaire
+      } catch (opError) {
+        console.error(`[ERREUR] Échec de synchronisation pour ${op.path}:`, opError);
+      }
+    }
+    
+    // Effacer les opérations synchronisées
+    await AsyncStorage.removeItem('pendingFirestoreOps');
+  } catch (error) {
+    console.log('[INFO] Firestore toujours indisponible, synchronisation reportée');
+  }
+};
+
+/**
+ * Version robuste pour obtenir des messages avec gestion de quota
+ */
+export const getMessagesWithFallback = async (conversationId, limit = 50) => {
+  const fallbackKey = `messages_${conversationId}`;
+  
+  try {
+    const messagesRef = collection(db, 'conversations', conversationId, 'messages');
+    const messagesQuery = query(messagesRef, orderBy('timestamp', 'desc'), limit(limit));
+    
+    const snapshot = await getDocs(messagesQuery);
+    const messages = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+    
+    // Mettre en cache les messages pour usage hors ligne
+    await AsyncStorage.setItem(fallbackKey, JSON.stringify(messages));
+    
+    return { success: true, messages };
+  } catch (error) {
+    console.error(`[ERREUR] getMessagesWithFallback:`, error);
+    
+    // Utiliser les messages en cache si disponibles
+    try {
+      const cachedMessages = await AsyncStorage.getItem(fallbackKey);
+      if (cachedMessages) {
+        return { success: true, messages: JSON.parse(cachedMessages), fromCache: true };
+      }
+    } catch (cacheError) {
+      console.error('[ERREUR] Échec du fallback AsyncStorage:', cacheError);
+    }
+    
+    return { success: false, error: error.message, quotaExceeded: error.message.includes('quota') };
+  }
+};
+
 // Sauvegarder le profil senior
 export const saveSeniorProfile = async (seniorData) => {
   try {

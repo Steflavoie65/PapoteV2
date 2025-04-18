@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useReducer } from 'react';
 import { StyleSheet, Text, View, SafeAreaView, TextInput, TouchableOpacity, FlatList, ActivityIndicator, SectionList, ScrollView, Image, Alert } from 'react-native';
 import { MaterialCommunityIcons, Entypo } from '@expo/vector-icons';
 import { subscribeToMessages, sendMessage, setTypingStatus, subscribeToTypingStatus, getChatboxResponse, getWelcomeMessage, createConversation, updateUserContext, getUserContext, getConversationId } from '../services/chatService';
@@ -11,6 +11,77 @@ import { query, orderBy, limit,collection, getDocs,doc, getDoc, setDoc, updateDo
 import { db } from '../firebase/config';
 import { useIsFocused } from '@react-navigation/native';
 import * as Location from 'expo-location';
+import contextService from '../services/contextService';
+
+// Définition du réducteur pour gérer l'état de la conversation
+function conversationReducer(state, action) {
+  switch (action.type) {
+    case 'SET_MESSAGES':
+      return {
+        ...state,
+        messages: action.payload
+      };
+    case 'SET_LOADING':
+      return {
+        ...state,
+        isLoading: action.payload
+      };
+    case 'SET_USER_ID':
+      return {
+        ...state,
+        userId: action.payload
+      };
+    case 'SET_TYPING':
+      return {
+        ...state,
+        isOtherTyping: action.payload
+      };
+    case 'SET_NEW_MESSAGE':
+      return {
+        ...state,
+        newMessage: action.payload
+      };
+    case 'SET_USER_CONTEXT':
+      return {
+        ...state,
+        userContext: action.payload
+      };
+    case 'TOGGLE_EMOJIS':
+      return {
+        ...state,
+        showEmojis: !state.showEmojis,
+        // Fermer les topics si on ouvre les emojis
+        showTopics: state.showEmojis ? state.showTopics : false
+      };
+    case 'TOGGLE_TOPICS':
+      return {
+        ...state,
+        showTopics: !state.showTopics,
+        // Fermer les emojis si on ouvre les topics
+        showEmojis: state.showTopics ? state.showEmojis : false
+      };
+    case 'RESET_UI_STATE':
+      return {
+        ...state,
+        showEmojis: false,
+        showTopics: false
+      };
+    default:
+      return state;
+  }
+}
+
+// État initial
+const initialState = {
+  messages: [],
+  isLoading: true,
+  userId: null,
+  isOtherTyping: false,
+  newMessage: '',
+  userContext: null,
+  showEmojis: false,
+  showTopics: false
+};
 
 const getSafeUri = async (uri) => {
   try {
@@ -184,18 +255,27 @@ const ImageMessage = ({ item, userId, messageTime }) => {
 
 const ChatScreen = ({ route, navigation }) => {
   const { participantId, participantName } = route.params;
-  const [messages, setMessages] = useState([]);
-  const [newMessage, setNewMessage] = useState('');
-  const isFocused = useIsFocused(); // ← 📍 ajoute-le ici
-  const [userId, setUserId] = useState(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isOtherTyping, setIsOtherTyping] = useState(false); // Une seule déclaration
-  const [showEmojis, setShowEmojis] = useState(false);
-  const [showTopics, setShowTopics] = useState(false);
-  const [userContext, setUserContext] = useState(null);
-  // Ajout d'une référence pour stocker l'objet de désabonnement
+  // Utilisation de useReducer pour une gestion d'état plus robuste
+  const [state, dispatch] = useReducer(conversationReducer, initialState);
+  
+  const isFocused = useIsFocused();
+  
+  // Références
+  const flatListRef = useRef(null);
+  const typingTimeoutRef = useRef(null);
   const unsubscribeRef = useRef(null);
   
+  // Extraction des valeurs d'état pour faciliter l'accès
+  const { 
+    messages, 
+    isLoading, 
+    userId, 
+    isOtherTyping, 
+    newMessage, 
+    userContext, 
+    showEmojis, 
+    showTopics 
+  } = state;
 
   const conversationTopics = [
     { emoji: '🌞', text: 'Ma journée', prompt: "Racontez-moi comment s'est passée votre journée ?" },
@@ -205,16 +285,13 @@ const ChatScreen = ({ route, navigation }) => {
     { emoji: '🤗', text: 'Discussion', prompt: "De quoi aimeriez-vous discuter ?" }
   ];
 
-  const handleTopicSelect = (topic) => {
-    handleSendMessage(topic.prompt);
-    setShowTopics(false);
-  };
-
-  const flatListRef = useRef(null);
-  const typingTimeoutRef = useRef(null);
-
   const quickEmojis = ['👋', '❤️', '😊', '👍', '🌞'];
   const quickMessages = ['Coucou !', 'Je pense à toi', 'Bonne journée', 'À bientôt'];
+
+  const handleTopicSelect = (topic) => {
+    handleSendMessage(topic.prompt);
+    dispatch({ type: 'RESET_UI_STATE' });
+  };
 
   const scrollToBottom = () => {
     if (flatListRef.current) {
@@ -275,30 +352,33 @@ const ChatScreen = ({ route, navigation }) => {
 
   useEffect(() => {
     const loadProfile = async () => {
-      setIsLoading(true);
+      dispatch({ type: 'SET_LOADING', payload: true });
+      
       const profileJson = await AsyncStorage.getItem('familyProfile') || await AsyncStorage.getItem('seniorProfile');
       const profile = JSON.parse(profileJson);
-      setUserId(profile?.profile?.userId);
+      dispatch({ type: 'SET_USER_ID', payload: profile?.profile?.userId });
 
-      // Ne pas créer d'abonnement ici, ce sera fait dans un autre useEffect
-
-      // Ajout : message de bienvenue automatique à chaque ouverture du chatbox
-      if (participantId === 'chatbox') {
-        const conversationId = getConversationId(profile?.profile?.userId, participantId);
-      
-        // Vérifie s’il y a déjà des messages dans cette conversation
-        const messagesRef = collection(db, 'conversations', conversationId, 'messages');
-        const messagesSnapshot = await getDocs(messagesRef);
-      
-        
+      // Check if OpenAI API key is set
+      const apiKey = await AsyncStorage.getItem('openai_api_key');
+      if (!apiKey && participantId === 'chatbox') {
+        Alert.alert(
+          "Clé API manquante",
+          "Pour utiliser le chatbot, vous devez configurer votre clé API OpenAI dans les paramètres.",
+          [
+            { text: "Plus tard" },
+            { 
+              text: "Configurer", 
+              onPress: () => navigation.navigate('Settings')
+            }
+          ]
+        );
       }
-      
 
-      setIsLoading(false);
+      dispatch({ type: 'SET_LOADING', payload: false });
     };
 
     loadProfile();
-  }, [participantId]);
+  }, [participantId, navigation]);
 
   useEffect(() => {
     const autoStartChatbox = async () => {
@@ -324,13 +404,16 @@ const ChatScreen = ({ route, navigation }) => {
             lastMessage.content &&
             /au revoir|bonne journée|à bientôt|n'hésitez pas|bye/i.test(lastMessage.content);
   
-          if (lastMessage.senderId === 'chatbox' && minutesSinceLast < 1 && !isClosureMessage) {
+          // Fix the contradiction here - if chatbot spoke recently, don't relaunch unless it was a closure
+          if (lastMessage.senderId === 'chatbox' && minutesSinceLast < 30 && !isClosureMessage) {
             console.log('[DEBUG] La chatbox a déjà parlé récemment, on ne relance pas.');
-            shouldRelance = false;
+            shouldRelance = false; // Don't relaunch if the chatbot spoke in the last 30 minutes
           } else if (isClosureMessage && minutesSinceLast >= 5) {
             console.log('[DEBUG] Dernier message était une fermeture, mais il date — on peut relancer !');
+            shouldRelance = true;
           } else if (lastMessage.senderId !== 'chatbox') {
-            console.log('[DEBUG] Dernier message vient de l’utilisateur — relance possible');
+            console.log('[DEBUG] Dernier message vient de l\'utilisateur — relance possible');
+            shouldRelance = true;
           }
         } else {
           console.log('[DEBUG] Aucun message précédent, première interaction — on lance');
@@ -338,43 +421,14 @@ const ChatScreen = ({ route, navigation }) => {
   
         if (shouldRelance) {
           console.log('[DEBUG] Relance automatique du chatbox avec un message chaleureux');
-          const response = await getChatboxResponse("Commence la discussion naturellement", userId);
-          const conversationId = getConversationId(userId, 'chatbox');
-          const messagesRef = collection(db, 'conversations', conversationId, 'messages');
-          const historyQuery = query(messagesRef, orderBy('timestamp', 'desc'), limit(10));
-          const historySnapshot = await getDocs(historyQuery);
-          const recentMsgs = historySnapshot.docs.map(doc => doc.data()).reverse();
-
-          const lines = recentMsgs.map(m => {
-            const who = m.senderId === 'chatbox' ? 'Moi' : (userContext?.firstName || 'Vous');
-            return `- ${who} : "${m.content}"`;
-          }).join('\n');
-
-          const lastDate = recentMsgs[0]?.timestamp?.toDate?.();
-          const now = new Date();
-          const daysSinceLast = lastDate ? Math.floor((now - lastDate) / (1000 * 60 * 60 * 24)) : null;
-
-          const temporalCue = daysSinceLast && daysSinceLast >= 3
-            ? `Cela fait ${daysSinceLast} jours depuis la dernière fois que vous avez échangé.`
-            : `Voici les derniers messages échangés récemment :`;
-
-          contextualizedPrompt = `
-          Tu es un compagnon virtuel chaleureux, amical et attentionné. Tu parles à ${userContext?.firstName || "l'utilisateur"}, une personne âgée avec qui tu as déjà eu plusieurs conversations.
-          Tu possèdes une mémoire des souvenirs importants (comme une naissance, une hospitalisation, un voyage), et tu consultes les derniers messages pour continuer naturellement la discussion.
-
-          ${temporalCue}
-
-          ${lines}
-
-          À partir de ces éléments, relance la conversation de façon fluide, comme le ferait un ami : évoque un souvenir pertinent s’il y en a un, demande des nouvelles, ou pose une question ouverte et bienveillante.
-
-          ⚠️ Ne redis pas de phrase robotique comme "Comment puis-je vous aider ?" ou "Avez-vous besoin d’aide ?"
-
-          ✅ Sois sincèrement intéressé, naturel, chaleureux, humain.
-
-          ✅ Termine ta phrase avec une question qui invite à la discussion.
-          `.trim();
-
+          
+          // Load user context first to personalize the welcome message
+          const context = await getUserContext(userId);
+          
+          // Get temporal context for better continuity
+          const temporalAndLocationContext = await getTemporalAndLocationContext();
+          
+          const response = await getChatboxResponse("Commence la discussion naturellement", userId, temporalAndLocationContext);
           await sendMessage(conversationId, 'chatbox', response, 'text');
         }
   
@@ -388,8 +442,6 @@ const ChatScreen = ({ route, navigation }) => {
     }
   }, [isFocused, participantId]);
   
-  
-
   useEffect(() => {
     // Défiler vers le bas quand de nouveaux messages arrivent
     if (messages.length > 0) {
@@ -401,7 +453,7 @@ const ChatScreen = ({ route, navigation }) => {
     const loadUserContext = async () => {
       if (userId) {
         const context = await getUserContext(userId);
-        setUserContext(context);
+        dispatch({ type: 'SET_USER_CONTEXT', payload: context });
       }
     };
     loadUserContext();
@@ -417,7 +469,7 @@ const ChatScreen = ({ route, navigation }) => {
           const conversationDoc = await getDoc(conversationRef);
           
           if (conversationDoc.exists()) {
-            setUserContext(conversationDoc.data().context || {});
+            dispatch({ type: 'SET_USER_CONTEXT', payload: conversationDoc.data().context || {} });
           } else {
             // Créer un nouveau contexte si la conversation n'existe pas
             const newContext = {
@@ -426,7 +478,7 @@ const ChatScreen = ({ route, navigation }) => {
               preferences: {}
             };
             await setDoc(conversationRef, { context: newContext });
-            setUserContext(newContext);
+            dispatch({ type: 'SET_USER_CONTEXT', payload: newContext });
           }
         }
       } catch (error) {
@@ -446,7 +498,7 @@ const ChatScreen = ({ route, navigation }) => {
           'context': { ...userContext, ...newContext },
           'lastUpdated': new Date()
         });
-        setUserContext(prev => ({ ...prev, ...newContext }));
+        dispatch({ type: 'SET_USER_CONTEXT', payload: { ...userContext, ...newContext } });
       }
     } catch (error) {
       console.error('Erreur mise à jour contexte:', error);
@@ -454,52 +506,92 @@ const ChatScreen = ({ route, navigation }) => {
   };
 
   const getTemporalAndLocationContext = async () => {
-    // Date et heure locales
+  try {
+    // Utiliser le service amélioré pour obtenir un contexte riche
+    return await contextService.getFullContextSummary();
+  } catch (error) {
+    console.error('[ERREUR] Récupération contexte:', error);
+    
+    // Fallback sur la méthode simplifiée
     const now = new Date();
     const dateString = now.toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
     const timeString = now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
-    // Localisation
-    let city = '';
-    try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status === 'granted') {
-        const location = await Location.getCurrentPositionAsync({});
-        const [place] = await Location.reverseGeocodeAsync(location.coords);
-        city = place.city || place.region || place.country || '';
-      }
-    } catch (e) {
-      // ignore si refusé
-    }
-    return `Nous sommes le ${dateString}, il est ${timeString}${city ? ' à ' + city : ''}.`;
-  };
+    return `Nous sommes le ${dateString}, il est ${timeString}.`;
+  }
+};
 
   const onSend = async (messageToSend = newMessage) => {
     const messageText = typeof messageToSend === 'object' ? newMessage : messageToSend;
-
+  
     if (!messageText.trim() || !userId || !participantId) {
       console.log('Invalid data:', { messageText, userId, participantId });
       return;
     }
-
+  
     try {
       const conversationId = getConversationId(userId, participantId);
       const result = await sendMessage(conversationId, userId, messageText.trim(), 'text');
-
+  
       if (result.success) {
-        setNewMessage('');
+        dispatch({ type: 'SET_NEW_MESSAGE', payload: '' });
+        dispatch({ type: 'RESET_UI_STATE' });
+        
         await updateUserContext(userId, {
           lastInteraction: new Date(),
           lastMessage: messageText.trim()
         });
-
+  
         // Si c'est le chatbox, demander la réponse IA et l'ajouter à la conversation
         if (participantId === 'chatbox') {
-          // AJOUT : contexte temporel et localisation
-          const temporalAndLocationContext = await getTemporalAndLocationContext();
-          const iaResponse = await getChatboxResponse(messageText.trim(), userId, temporalAndLocationContext);
-          console.log('[DEBUG] Réponse IA:', iaResponse); // Ajout log pour vérifier la réponse IA
-          if (iaResponse) {
-            await sendMessage(conversationId, 'chatbox', iaResponse, 'text');
+          // Vérifier si c'est une réponse courte liée à la météo (comme "Et demain?")
+          const isShortResponse = messageText.trim().length < 15; // Message court
+          const contextualQuery = contextService.detectContextualQuery(messageText.trim());
+          let response;
+          
+          // Traitement spécial pour les requêtes météo
+          if ((contextualQuery.type === 'weather' && contextualQuery.entities?.forecast) || 
+              (isShortResponse && /demain/i.test(messageText.trim()))) {
+            
+            // Pour les réponses courtes, vérifier si le contexte précédent est météo
+            if (isShortResponse && /demain/i.test(messageText.trim())) {
+              const recentMsgsQuery = query(
+                collection(db, 'conversations', conversationId, 'messages'), 
+                orderBy('timestamp', 'desc'), 
+                limit(3)
+              );
+              const recentMsgsSnap = await getDocs(recentMsgsQuery);
+              const recentMsgs = recentMsgsSnap.docs.map(doc => doc.data());
+              
+              // Vérifier si la conversation récente concernait la météo
+              const isPreviousWeather = recentMsgs.some(msg => 
+                msg.senderId === 'chatbox' && 
+                msg.content && 
+                typeof msg.content === 'string' && 
+                /météo|température|temps|fait[-\s]il|°C|degrés|chaud|froid/i.test(msg.content)
+              );
+              
+              if (isPreviousWeather) {
+                console.log('[DEBUG] Contexte météo récent détecté pour requête courte, utilisation des prévisions');
+                response = await contextService.getWeatherForecastForUser();
+              } else {
+                // Pas de contexte météo, traitement normal
+                const temporalAndLocationContext = await getTemporalAndLocationContext();
+                response = await getChatboxResponse(messageText.trim(), userId, temporalAndLocationContext);
+              }
+            } else {
+              // Requête météo explicite pour demain
+              console.log('[DEBUG] Requête météo pour demain détectée, utilisation directe du service météo');
+              response = await contextService.getWeatherForecastForUser();
+            }
+          } else {
+            // Pour les autres requêtes, utiliser le traitement normal
+            const temporalAndLocationContext = await getTemporalAndLocationContext();
+            response = await getChatboxResponse(messageText.trim(), userId, temporalAndLocationContext);
+          }
+          
+          console.log('[DEBUG] Réponse IA:', response);
+          if (response) {
+            await sendMessage(conversationId, 'chatbox', response, 'text');
           }
         }
       } else {
@@ -519,7 +611,7 @@ const ChatScreen = ({ route, navigation }) => {
     try {
       const result = await sendMessage(conversationId, messageSenderId, message.trim(), 'text');
       if (result.success) {
-        setNewMessage('');
+        dispatch({ type: 'SET_NEW_MESSAGE', payload: '' });
       } else {
         Alert.alert('Erreur', 'Message non envoyé');
       }
@@ -539,7 +631,7 @@ const ChatScreen = ({ route, navigation }) => {
       
       // Désabonner de l'abonnement précédent s'il existe
       if (unsubscribeRef.current) {
-        console.log('[DEBUG] Désabonnement de l\'abonnement précédent');
+        console.log("[DEBUG] Désabonnement de l'abonnement précédent");
         unsubscribeRef.current();
         unsubscribeRef.current = null;
       }
@@ -548,22 +640,52 @@ const ChatScreen = ({ route, navigation }) => {
       unsubscribeRef.current = subscribeToMessages(conversationId, (newMessages) => {
         console.log(`[DEBUG] Nouveaux messages reçus (${newMessages.length})`);
         if (typeof newMessages === 'object' && Array.isArray(newMessages)) {
-          setMessages(newMessages);
+          dispatch({ type: 'SET_MESSAGES', payload: newMessages });
         } else {
           console.warn('Invalid messages received:', newMessages);
         }
       });
+      
+      // S'abonner au statut de frappe
+      const typingUnsubscribe = subscribeToTypingStatus(
+        conversationId,
+        userId,
+        (typing) => dispatch({ type: 'SET_TYPING', payload: typing })
+      );
+      
+      // Combiner les fonctions de désabonnement
+      const combinedUnsubscribe = () => {
+        if (unsubscribeRef.current) unsubscribeRef.current();
+        if (typingUnsubscribe) typingUnsubscribe();
+      };
+      
+      unsubscribeRef.current = combinedUnsubscribe;
     }
     
     // Nettoyer l'abonnement lors du démontage du composant
     return () => {
       if (unsubscribeRef.current) {
-        console.log('[DEBUG] Nettoyage de l\'abonnement aux messages');
+        console.log("[DEBUG] Nettoyage de l'abonnement aux messages");
         unsubscribeRef.current();
         unsubscribeRef.current = null;
       }
     };
   }, [userId, participantId]); // Se réabonner uniquement si userId ou participantId change
+
+  useEffect(() => {
+    if (participantId === 'chatbox') {
+      navigation.setOptions({
+        headerRight: () => (
+          <TouchableOpacity 
+            onPress={() => navigation.navigate('Settings')}
+            style={{ paddingRight: 15 }}
+          >
+            <MaterialCommunityIcons name="cog" size={24} color="#4285F4" />
+          </TouchableOpacity>
+        ),
+      });
+    }
+  }, [navigation, participantId]);
 
   const handleTyping = () => {
     if (!userId) return;
@@ -722,57 +844,55 @@ const ChatScreen = ({ route, navigation }) => {
   );
 
   const renderMessage = ({ item }) => {
-    // Vérifications de sécurité
-    if (!item) {
-      console.warn('[DEBUG] Message invalide:', item);
-      return null;
-    }
-  
-    // S'assurer que le contenu existe et est une chaîne
-    if (!item.content && item.type !== 'image') {
-      console.warn('[DEBUG] Message sans contenu:', item);
-      return null;
-    }
-  
-    // S'assurer que le contenu est une chaîne
-    const messageContent = typeof item.content === 'object' 
-      ? JSON.stringify(item.content)
-      : String(item.content || '');
-  
-    const messageTime = formatMessageTime(item.timestamp);
-  
-    if (item.type === 'image') {
-      return <ImageMessage item={item} userId={userId} messageTime={messageTime} />;
-    }
-  
-    return (
-      <View
-        style={[
-          styles.messageContainer,
-          item.senderId === userId ? styles.sentMessage : styles.receivedMessage
-        ]}
-      >
-        <Text
+    // Vérifications de sécurité avec sortie rapide
+    if (!item) return null;
+    if ((!item.content && item.type !== 'image')) return null;
+    
+    try {
+      // S'assurer que le contenu est une chaîne
+      const messageContent = typeof item.content === 'object' 
+        ? JSON.stringify(item.content)
+        : String(item.content || '');
+    
+      const messageTime = formatMessageTime(item.timestamp);
+    
+      if (item.type === 'image') {
+        return <ImageMessage item={item} userId={userId} messageTime={messageTime} />;
+      }
+    
+      return (
+        <View
           style={[
-            styles.messageText,
-            item.senderId === userId ? styles.sentMessageText : styles.receivedMessageText
+            styles.messageContainer,
+            item.senderId === userId ? styles.sentMessage : styles.receivedMessage
           ]}
         >
-          {messageContent}
-        </Text>
-        <View style={styles.messageFooter}>
-          <Text style={styles.messageTime}>{messageTime}</Text>
-          {item.senderId === userId && (
-            <MaterialCommunityIcons
-              name={item.read ? 'check-all' : 'check'}
-              size={16}
-              color={item.read ? '#4CAF50' : '#999'}
-              style={styles.readIndicator}
-            />
-          )}
+          <Text
+            style={[
+              styles.messageText,
+              item.senderId === userId ? styles.sentMessageText : styles.receivedMessageText
+            ]}
+            numberOfLines={0}
+          >
+            {messageContent}
+          </Text>
+          <View style={styles.messageFooter}>
+            <Text style={styles.messageTime}>{messageTime}</Text>
+            {item.senderId === userId && (
+              <MaterialCommunityIcons
+                name={item.read ? 'check-all' : 'check'}
+                size={16}
+                color={item.read ? '#4CAF50' : '#999'}
+                style={styles.readIndicator}
+              />
+            )}
+          </View>
         </View>
-      </View>
-    );
+      );
+    } catch (error) {
+      console.error('[ERROR] Erreur de rendu du message:', error);
+      return null; // Retourner null en cas d'erreur pour éviter le crash
+    }
   };
 
   if (isLoading) {
@@ -798,14 +918,24 @@ const ChatScreen = ({ route, navigation }) => {
       <View style={styles.chatContainer}>
         <FlatList
           ref={flatListRef}
-          data={messages.slice(-10)} // Afficher seulement les 10 derniers messages
-          keyExtractor={item => item.id}
+          data={messages}
+          keyExtractor={item => item.id || `msg-${Date.now()}-${Math.random()}`}
           renderItem={renderMessage}
           contentContainerStyle={styles.messageList}
           style={styles.messageContainer}
           onContentSizeChange={scrollToBottom}
           onLayout={scrollToBottom}
+          initialNumToRender={10}
+          maxToRenderPerBatch={10}
+          windowSize={10}
+          removeClippedSubviews={true}
         />
+
+        {isOtherTyping && (
+          <View style={styles.typingContainer}>
+            <Text style={styles.typingText}>{participantName} est en train d'écrire...</Text>
+          </View>
+        )}
 
         {showEmojis && (
           <View style={styles.quickActionsContainer}>
@@ -832,7 +962,7 @@ const ChatScreen = ({ route, navigation }) => {
           </TouchableOpacity>
           <TouchableOpacity
             style={styles.emojiButton}
-            onPress={() => setShowEmojis(!showEmojis)}
+            onPress={() => dispatch({ type: 'TOGGLE_EMOJIS' })}
           >
             <Entypo name="emoji-happy" size={24} color="#666" />
           </TouchableOpacity>
@@ -841,7 +971,7 @@ const ChatScreen = ({ route, navigation }) => {
             style={styles.input}
             value={newMessage}
             onChangeText={(text) => {
-              setNewMessage(text);
+              dispatch({ type: 'SET_NEW_MESSAGE', payload: text });
               handleTyping();
             }}
             placeholder="Écrivez votre message..."
@@ -862,7 +992,7 @@ const ChatScreen = ({ route, navigation }) => {
           </TouchableOpacity>
           <TouchableOpacity
             style={styles.topicsButton}
-            onPress={() => setShowTopics(!showTopics)}
+            onPress={() => dispatch({ type: 'TOGGLE_TOPICS' })}
           >
             <MaterialCommunityIcons name="format-list-bulleted" size={24} color="#666" />
           </TouchableOpacity>
@@ -877,6 +1007,22 @@ const ChatScreen = ({ route, navigation }) => {
                 onPress={() => onSend(msg)}
               >
                 <Text style={styles.quickMessageText}>{msg}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
+        
+        {showTopics && (
+          <View style={styles.quickMessagesContainer}>
+            {conversationTopics.map((topic, index) => (
+              <TouchableOpacity
+                key={index}
+                style={styles.quickMessageButton}
+                onPress={() => handleTopicSelect(topic)}
+              >
+                <Text style={styles.quickMessageText}>
+                  {topic.emoji} {topic.text}
+                </Text>
               </TouchableOpacity>
             ))}
           </View>

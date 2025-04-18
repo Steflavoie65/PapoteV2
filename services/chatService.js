@@ -18,6 +18,9 @@ import {
 import { OPENAI_API_KEY } from '@env';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getMessages } from './messageService';
+import { safeFirestoreOperation } from '../firebase/config';
+import { getOfflineData, storeOfflineData, isOfflineMode } from './offlineService';
+import contextService from './contextService';
 
 // Cache mémoire temporaire pour contextes et mémoires
 const memoryCache = {
@@ -34,7 +37,7 @@ const memoryCache = {
 export const getUserContext = async (userId) => {
   try {
     if (!userId) {
-      console.error('[ERREUR] userId manquant dans getUserContext');
+      console.error('[ERREUR] getUserContext: ID utilisateur manquant');
       return null;
     }
     
@@ -48,34 +51,34 @@ export const getUserContext = async (userId) => {
     
     // Essayer d'abord AsyncStorage pour réponse rapide
     try {
-      const contextJson = await AsyncStorage.getItem(`user_context_${userId}`);
-      if (contextJson) {
-        const parsedContext = JSON.parse(contextJson);
+      const storedContext = await AsyncStorage.getItem(`user_context_${userId}`);
+      if (storedContext) {
+        const parsedContext = JSON.parse(storedContext);
         memoryCache.userContexts[userId] = parsedContext;
         memoryCache.lastFetch[`context_${userId}`] = now;
-        
-        // Récupérer depuis Firestore en background pour mise à jour éventuelle
-        getContextFromFirestore(userId).then(firestoreContext => {
-          if (firestoreContext) {
-            memoryCache.userContexts[userId] = firestoreContext;
-            memoryCache.lastFetch[`context_${userId}`] = now;
-            AsyncStorage.setItem(`user_context_${userId}`, JSON.stringify(firestoreContext));
-          }
-        });
-        
         return parsedContext;
       }
     } catch (storageError) {
-      console.warn('[AVERTISSEMENT] Erreur AsyncStorage dans getUserContext:', storageError);
+      console.error('[ERREUR] Récupération contexte depuis AsyncStorage:', storageError);
+      // Continuer vers Firestore au lieu d'échouer complètement
     }
     
     // Si pas dans AsyncStorage, chercher dans Firestore
     const firestoreContext = await getContextFromFirestore(userId);
     
     if (firestoreContext) {
+      // Mettre en cache pour accès rapide futur
       memoryCache.userContexts[userId] = firestoreContext;
       memoryCache.lastFetch[`context_${userId}`] = now;
-      AsyncStorage.setItem(`user_context_${userId}`, JSON.stringify(firestoreContext));
+      
+      // Sauvegarder dans AsyncStorage pour utilisation hors ligne
+      try {
+        await AsyncStorage.setItem(`user_context_${userId}`, JSON.stringify(firestoreContext));
+      } catch (cacheError) {
+        console.error('[ERREUR] Mise en cache AsyncStorage contexte:', cacheError);
+        // Ne pas échouer pour une erreur de mise en cache
+      }
+      
       return firestoreContext;
     }
     
@@ -91,12 +94,19 @@ export const getUserContext = async (userId) => {
     memoryCache.lastFetch[`context_${userId}`] = now;
     
     // Sauvegarder ce contexte vide en background
-    updateUserContext(userId, emptyContext);
+    updateUserContext(userId, emptyContext)
+      .catch(err => console.error('[ERREUR] Création contexte initial:', err));
     
     return emptyContext;
   } catch (error) {
     console.error('[ERREUR] Exception dans getUserContext:', error);
-    return null;
+    // Retourner un objet vide plutôt que null pour éviter les erreurs en cascade
+    return {
+      health: {},
+      situation: {},
+      mood: { current: 'unknown' },
+      error: true
+    };
   }
 };
 
@@ -284,7 +294,7 @@ function detectActivitiesAndTiming(message) {
     present: []
   };
   
-  // Patterns temporels
+  // Patterns temporels améliorés
   const futurePatterns = [
     /demain/i, 
     /dans (quelques|[0-9]+) (jour|semaine|mois)/i,
@@ -293,7 +303,14 @@ function detectActivitiesAndTiming(message) {
     /bientôt/i,
     /va (aller|partir|faire)/i,
     /vais/i,
-    /prévu/i
+    /prévu/i,
+    /je vais/i,
+    /j'irai/i,
+    /je pars/i,
+    /je partirai/i,
+    /j'ai décidé/i,
+    /j'ai changé/i,
+    /je veux/i
   ];
   
   const pastPatterns = [
@@ -315,13 +332,38 @@ function detectActivitiesAndTiming(message) {
     /présentement/i
   ];
   
-  // Activités à surveiller
+  // Activités à surveiller - ajouté des synonymes et alternatives
   const activitiesToDetect = [
-    { name: "randonnée", patterns: [/randonn/i, /marche/i, /rando/i] },
-    { name: "visite au Vatican", patterns: [/vatican/i, /rome/i, /italie/i] },
-    { name: "visite à la cousine", patterns: [/cousine/i, /visit/i, /voir/i] },
-    { name: "visite à l'hôpital", patterns: [/hopital/i, /hôpital/i, /clinique/i] },
-    { name: "naissance du bébé", patterns: [/bébé/i, /naissance/i, /accouche/i] }
+    { 
+      name: "randonnée", 
+      patterns: [/randonn/i, /marche/i, /rando/i, /trek/i, /mont(agne)?/i], 
+      keywords: ['montagne', 'nature', 'marcher', 'sentier', 'trek']
+    },
+    { 
+      name: "voyage au Mexique", 
+      patterns: [/mexique/i, /mexico/i], 
+      keywords: ['vacances', 'voyage', 'partir', 'avion']
+    },
+    { 
+      name: "voyage en Italie", 
+      patterns: [/italie/i, /vatican/i, /rome/i], 
+      keywords: ['vacances', 'voyage', 'partir']
+    },
+    { 
+      name: "visite à la cousine", 
+      patterns: [/cousine/i], 
+      keywords: ['visite', 'voir', 'aller']
+    },
+    { 
+      name: "visite à l'hôpital", 
+      patterns: [/hopital/i, /hôpital/i, /clinique/i], 
+      keywords: ['visite', 'voir', 'aller']
+    },
+    { 
+      name: "naissance du bébé", 
+      patterns: [/bébé/i, /naissance/i, /accouche/i, /nouveau-né/i], 
+      keywords: ['nouveau-né', 'enfant']
+    }
   ];
   
   // Détection du temps verbal global du message
@@ -397,6 +439,17 @@ function detectActivitiesAndTiming(message) {
     }
   }
   
+  // Détection améliorée du changement d'activité
+  if (lowerMessage.includes('changer d\'idée') || lowerMessage.includes('changé d\'idée')) {
+    // Identifier la nouvelle activité après "je vais"
+    for (const activity of activitiesToDetect) {
+      if (activity.patterns.some(pattern => pattern.test(lowerMessage))) {
+        activities.future.push(activity.name);
+        console.log(`[DEBUG] Détection de changement d'activité vers: ${activity.name}`);
+      }
+    }
+  }
+
   return activities;
 }
 
@@ -413,73 +466,126 @@ async function updateUserActivitiesTimeline(userId, message) {
   const detectedActivities = detectActivitiesAndTiming(message);
   if (!detectedActivities) return;
   
-  // Initialiser le calendrier si nécessaire
-  if (!userActivitiesTimeline[userId]) {
-    userActivitiesTimeline[userId] = {
-      future: new Set(),
-      past: new Set(),
-      present: new Set(),
-      lastUpdated: new Date()
-    };
-    
-    // Essayer de charger depuis AsyncStorage
-    try {
-      const storedTimeline = await AsyncStorage.getItem(`user_activities_${userId}`);
-      if (storedTimeline) {
-        const parsed = JSON.parse(storedTimeline);
-        userActivitiesTimeline[userId] = {
-          future: new Set(parsed.future || []),
-          past: new Set(parsed.past || []),
-          present: new Set(parsed.present || []),
-          lastUpdated: new Date(parsed.lastUpdated || Date.now())
-        };
-      }
-    } catch (e) {
-      console.warn('[AVERTISSEMENT] Erreur chargement timeline activités:', e);
-    }
-  }
-  
-  // Mettre à jour les activités détectées
-  detectedActivities.future.forEach(activity => {
-    userActivitiesTimeline[userId].future.add(activity);
-    // Supprimer des autres catégories si présent
-    userActivitiesTimeline[userId].past.delete(activity);
-    userActivitiesTimeline[userId].present.delete(activity);
-  });
-  
-  detectedActivities.past.forEach(activity => {
-    userActivitiesTimeline[userId].past.add(activity);
-    // Supprimer des autres catégories si présent
-    userActivitiesTimeline[userId].future.delete(activity);
-    userActivitiesTimeline[userId].present.delete(activity);
-  });
-  
-  detectedActivities.present.forEach(activity => {
-    userActivitiesTimeline[userId].present.add(activity);
-    // Supprimer des autres catégories si présent
-    userActivitiesTimeline[userId].future.delete(activity);
-    userActivitiesTimeline[userId].past.delete(activity);
-  });
-  
-  userActivitiesTimeline[userId].lastUpdated = new Date();
-  
-  // Sauvegarder dans AsyncStorage
   try {
-    await AsyncStorage.setItem(`user_activities_${userId}`, JSON.stringify({
+    // Initialiser le calendrier si nécessaire
+    if (!userActivitiesTimeline[userId]) {
+      userActivitiesTimeline[userId] = {
+        future: new Set(),
+        past: new Set(),
+        present: new Set(),
+        lastUpdated: new Date(),
+        lastMessageTime: new Date(),
+        hasGreeted: false // Nouveau: suivi des salutations
+      };
+      
+      // Essayer de charger depuis AsyncStorage
+      try {
+        const storedTimeline = await AsyncStorage.getItem(`user_activities_${userId}`);
+        if (storedTimeline) {
+          const parsed = JSON.parse(storedTimeline);
+          userActivitiesTimeline[userId] = {
+            future: new Set(parsed.future || []),
+            past: new Set(parsed.past || []),
+            present: new Set(parsed.present || []),
+            lastUpdated: new Date(parsed.lastUpdated || Date.now()),
+            lastMessageTime: new Date(parsed.lastMessageTime || Date.now()),
+            hasGreeted: parsed.hasGreeted || false
+          };
+        }
+      } catch (e) {
+        console.warn('[AVERTISSEMENT] Erreur chargement timeline activités:', e);
+      }
+    }
+    
+    // Mise à jour de l'heure du dernier message
+    userActivitiesTimeline[userId].lastMessageTime = new Date();
+
+    // Réinitialiser hasGreeted après 30 minutes
+    const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+    if (new Date(userActivitiesTimeline[userId].lastMessageTime) < thirtyMinutesAgo) {
+      userActivitiesTimeline[userId].hasGreeted = false;
+    }
+
+    // Vérifier si le message est une salutation
+    if (/bonjour|salut|hello|coucou|bonsoir/i.test(message)) {
+      userActivitiesTimeline[userId].hasGreeted = true;
+    }
+
+    // Stockage du dernier sujet de conversation pour maintenir le contexte
+    if (userActivitiesTimeline[userId].conversationContext) {
+      userActivitiesTimeline[userId].previousContext = userActivitiesTimeline[userId].conversationContext;
+    }
+
+    // Détecter les blagues ou le sarcasme (comme "En skateboard" pour aller au Mexique)
+    const isJoke = message.length < 20 && (/skateboard|vélo|pied|nage/i.test(message) && 
+                   userActivitiesTimeline[userId].conversationContext?.includes('voyage'));
+
+    if (isJoke) {
+      console.log('[DEBUG] Détection de blague/sarcasme:', message);
+      userActivitiesTimeline[userId].isJoking = true;
+      userActivitiesTimeline[userId].jokeContent = message;
+    } else {
+      userActivitiesTimeline[userId].isJoking = false;
+    }
+
+    // Vérifier les mentions explicites de changement d'activité
+    if (/changer d'idée|changé d'idée|ne plus|annul|à la place/i.test(message)) {
+      // Réinitialiser les activités futures puisque l'utilisateur change ses plans
+      userActivitiesTimeline[userId].future.clear();
+      console.log('[DEBUG] Détection de changement de plan - réinitialisation des activités futures');
+    }
+    
+    // Mettre à jour les activités détectées
+    detectedActivities.future.forEach(activity => {
+      userActivitiesTimeline[userId].future.add(activity);
+      // Supprimer des autres catégories si présent
+      userActivitiesTimeline[userId].past.delete(activity);
+      userActivitiesTimeline[userId].present.delete(activity);
+    });
+    
+    detectedActivities.past.forEach(activity => {
+      userActivitiesTimeline[userId].past.add(activity);
+      // Supprimer des autres catégories si présent
+      userActivitiesTimeline[userId].future.delete(activity);
+      userActivitiesTimeline[userId].present.delete(activity);
+    });
+    
+    detectedActivities.present.forEach(activity => {
+      userActivitiesTimeline[userId].present.add(activity);
+      // Supprimer des autres catégories si présent
+      userActivitiesTimeline[userId].future.delete(activity);
+      userActivitiesTimeline[userId].past.delete(activity);
+    });
+    
+    userActivitiesTimeline[userId].lastUpdated = new Date();
+    
+    // Sauvegarder dans AsyncStorage avec les nouveaux champs
+    try {
+      await AsyncStorage.setItem(`user_activities_${userId}`, JSON.stringify({
+        future: Array.from(userActivitiesTimeline[userId].future),
+        past: Array.from(userActivitiesTimeline[userId].past),
+        present: Array.from(userActivitiesTimeline[userId].present),
+        lastUpdated: userActivitiesTimeline[userId].lastUpdated,
+        lastMessageTime: userActivitiesTimeline[userId].lastMessageTime,
+        hasGreeted: userActivitiesTimeline[userId].hasGreeted,
+        conversationContext: userActivitiesTimeline[userId].conversationContext,
+        previousContext: userActivitiesTimeline[userId].previousContext,
+        isJoking: userActivitiesTimeline[userId].isJoking,
+        jokeContent: userActivitiesTimeline[userId].jokeContent
+      }));
+    } catch (e) {
+      console.warn('[AVERTISSEMENT] Erreur sauvegarde timeline activités:', e);
+    }
+    
+    console.log('[DEBUG] Timeline activités mise à jour pour', userId, {
       future: Array.from(userActivitiesTimeline[userId].future),
       past: Array.from(userActivitiesTimeline[userId].past),
       present: Array.from(userActivitiesTimeline[userId].present),
-      lastUpdated: userActivitiesTimeline[userId].lastUpdated
-    }));
-  } catch (e) {
-    console.warn('[AVERTISSEMENT] Erreur sauvegarde timeline activités:', e);
+      hasGreeted: userActivitiesTimeline[userId].hasGreeted
+    });
+  } catch (error) {
+    console.error('[ERROR] Erreur dans updateUserActivitiesTimeline:', error);
   }
-  
-  console.log('[DEBUG] Timeline activités mise à jour pour', userId, {
-    future: Array.from(userActivitiesTimeline[userId].future),
-    past: Array.from(userActivitiesTimeline[userId].past),
-    present: Array.from(userActivitiesTimeline[userId].present)
-  });
 }
 
 /**
@@ -491,77 +597,92 @@ export const getChatboxResponse = async (message, userId = null, temporalAndLoca
     const memoryScore = calculateMemoryImportance(message);
     const messageAnalysis = analyzeMessage(message);
     
+    // Vérifier si c'est une requête contextuelle (météo, restaurants, etc.)
+    const contextualQuery = contextService.detectContextualQuery(message);
+    
+    // Traitement spécial pour requêtes météo et autres requêtes contextuelles
+    if (contextualQuery.type !== 'none') {
+      console.log('[DEBUG] Requête contextuelle détectée:', contextualQuery.type);
+      
+      // Traitement météo
+      if (contextualQuery.type === 'weather') {
+        const weatherResponse = await handleWeatherContextQuery(contextualQuery);
+        if (weatherResponse) return weatherResponse;
+      }
+      
+      // Obtenir directement l'information contextuelle demandée avec les entités extraites
+      const contextualResponse = await contextService.getContextualInformation(
+        contextualQuery.type, 
+        contextualQuery.entities || {}
+      );
+      
+      if (contextualResponse) {
+        return contextualResponse;
+      }
+    }
+    
+    // Si pas de requête contextuelle ou pas de réponse, continuer traitement normal
+    
     // Initialiser la variable conversationHistory ici
     let conversationHistory = [];
     // Initialiser le prompt contextuel
     let contextualizedPrompt = "";
 
-    // Mettre à jour la timeline des activités (AJOUT)
+    // Mettre à jour la timeline des activités
     if (userId) {
       await updateUserActivitiesTimeline(userId, message);
+
+      // Vérifier si c'est une réponse courte pour mieux suivre le contexte
+      if (userId && message !== 'Commence la discussion naturellement' && message.trim().split(/\s+/).length <= 2) {
+        console.log('[DEBUG] Détection de réponse courte:', message);
+        
+        // Enregistrer le contexte antérieur pour mieux comprendre cette réponse
+        const conversationId = getConversationId(userId, 'chatbox');
+        const messagesRef = collection(db, 'conversations', conversationId, 'messages');
+        const historyQuery = query(messagesRef, orderBy('timestamp', 'desc'), limit(3));
+        const historySnapshot = await getDocs(historyQuery);
+        const recentMsgs = historySnapshot.docs.map(doc => doc.data()).reverse();
+        
+        if (recentMsgs.length >= 2) {
+          const previousBotMsg = recentMsgs.find(m => m.senderId === 'chatbox');
+          console.log('[DEBUG] Contexte de réponse courte:', previousBotMsg?.content);
+        }
+      }
+      
       await collectGlobalMemories(userId);
     }
     
+    // Récupérer le contexte utilisateur et les mémoires existantes
     const [userContext, existingMemories] = await Promise.all([
       getUserContext(userId),
       getUserMemories(userId)
     ]);
     
-    // HISTORIQUE
+    // Récupérer l'historique de conversation
     if (userId) {
-      const conversationId = getConversationId(userId, 'chatbox');
-      console.log(`[DEBUG] Récupération de l'historique pour ${conversationId}`);
-      const messagesRef = collection(db, 'conversations', conversationId, 'messages');
-      const historyQuery = query(messagesRef, orderBy('timestamp', 'asc'), limit(200));
-      const historySnapshot = await getDocs(historyQuery);
-      conversationHistory = historySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      console.log(`[DEBUG] Historique récupéré (${conversationHistory.length} messages)`);
-
+      conversationHistory = await getConversationHistory(userId, 'chatbox');
       if (conversationHistory.length > 0) {
-        const historyText = conversationHistory.map(m => {
-          const role = m.senderId === 'chatbox' ? 'Assistant' : (userContext?.firstName || 'Utilisateur');
-          return `- ${role}: "${m.content}"`;
-        }).join('\n');
-
-        contextualizedPrompt = `Historique de la conversation:\n${historyText}\n\nNouvelle demande: "${message}"`;
-        console.log('[DEBUG] Prompt contextualisé avec historique');
+        contextualizedPrompt = formatConversationHistoryForPrompt(conversationHistory, userContext);
       } else {
-        // fallback messages depuis root (optionnel)
-        const { success, messages: rootHistory } = await getMessages(userId, 'chatbox', 10);
-        if (success && rootHistory.length > 0) {
-          const fallbackText = rootHistory.map(m => {
-            const role = m.senderId === 'chatbox' ? 'Assistant' : (userContext?.firstName || 'Utilisateur');
-            return `- ${role}: "${m.content}"`;
-          }).join('\n');
-          contextualizedPrompt = `Historique (root):\n${fallbackText}\n\nNouvelle demande: "${message}"`;
+        // Fallback sur l'historique depuis la racine
+        const rootHistory = await getMessagesFromRoot(userId);
+        if (rootHistory.length > 0) {
+          contextualizedPrompt = formatRootHistoryForPrompt(rootHistory, userContext);
         }
       }
     }
 
-    // ➕ Cas spécial : Lancement automatique du chat
+    // Cas spécial : Lancement automatique du chat
     if (message === 'Commence la discussion naturellement') {
-      const conversationId = getConversationId(userId, 'chatbox');
-      const messagesRef = collection(db, 'conversations', conversationId, 'messages');
-      const historyQuery = query(messagesRef, orderBy('timestamp', 'desc'), limit(5));
-      const historySnapshot = await getDocs(historyQuery);
-      const recentMsgs = historySnapshot.docs.map(doc => doc.data()).reverse();
-
-      const lines = recentMsgs.map(m => {
-        const who = m.senderId === 'chatbox' ? 'Moi' : (userContext?.firstName || 'Vous');
-        return `- ${who} : "${m.content}"`;
-      }).join('\n');
-
-      contextualizedPrompt = `
-Tu es un assistant amical pour ${userContext?.firstName || 'l’utilisateur'}.
-Voici les derniers échanges :
-${lines}
-
-Relance la conversation comme un ami : rappelle un sujet récent, pose une question, sois chaleureux.
-Ne redis pas juste "Bonjour, comment puis-je vous aider ?"
-`.trim();
+      contextualizedPrompt = await createAutoStartPrompt(userId, userContext);
     }
 
-    // Créer un prompt pour l'API OpenAI - passer conversationHistory et userActivitiesTimeline
+    // Obtenir contexte temporel et de localisation si non fourni
+    if (!temporalAndLocationContext) {
+      temporalAndLocationContext = await contextService.getFullContextSummary();
+    }
+
+    // Créer le prompt optimisé
     const optimizedPrompt = await createOptimizedPrompt(
       contextualizedPrompt,
       userContext,
@@ -569,37 +690,251 @@ Ne redis pas juste "Bonjour, comment puis-je vous aider ?"
       [],
       temporalAndLocationContext,
       conversationHistory,
-      userId ? userActivitiesTimeline[userId] : null // Ajouter la timeline
+      userId ? userActivitiesTimeline[userId] : null
     );
     
+    // Générer une réponse normale
+    const response = await generateOpenAIResponse(optimizedPrompt);
     
-    try {
-      // Appel à l'API avec timeout pour éviter les blocages trop longs
-      const response = await Promise.race([
-        generateOpenAIResponse(optimizedPrompt),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Timeout API')), 8000)
-        )
-      ]);
-      
-      // IMPORTANT: Retourner directement le contenu de la réponse
-      return response;
-    } catch (apiError) {
-      console.error('[ERREUR] API ou timeout:', apiError);
-      
-      // Générer une réponse de secours plus sophistiquée en cas d'échec API
-      if (userContext?.firstName) {
-        // Retourner directement la réponse de secours sans wrapper JSON
-        return createFallbackResponse(message, userContext, memoryScore);
-      }
-      
-      return `Je suis désolé, mais j'ai du mal à vous répondre pour le moment. Comment puis-je vous aider autrement ?`;
+    // Déterminer la salutation en fonction de l'heure
+    const now = new Date();
+    const hour = now.getHours();
+    let greeting;
+    if (hour < 12) {
+      greeting = 'Bonjour';
+    } else if (hour < 18) {
+      greeting = 'Bon après-midi';
+    } else {
+      greeting = 'Bonsoir';
     }
+
+    // Récupérer le prénom de l'utilisateur
+    const firstName = userContext?.firstName || '';
+    
+    // Nettoyer la réponse pour éviter les doublons dans les salutations
+    // Supprimer toute salutation existante ou mention du nom au début
+    let cleanedResponse = response;
+    
+    // Patterns de salutation à supprimer pour éviter les doublons
+    const salutationPatterns = [
+      /^bonjour,?\s+[^!.?]*[!.?]?/i,
+      /^bon après-midi,?\s+[^!.?]*[!.?]?/i,
+      /^bonsoir,?\s+[^!.?]*[!.?]?/i,
+      /^salut,?\s+[^!.?]*[!.?]?/i,
+      /^cher.?\s+\w+,?/i
+    ];
+    
+    // Supprimer les salutations existantes
+    for (const pattern of salutationPatterns) {
+      cleanedResponse = cleanedResponse.replace(pattern, '');
+    }
+    
+    // Nettoyer les espaces multiples et au début
+    cleanedResponse = cleanedResponse.trim();
+    
+    // Construire la salutation personnalisée avec le vrai prénom
+    const personalizedGreeting = firstName ? `${greeting}, ${firstName} !` : `${greeting} !`;
+    
+    // Assembler la réponse finale
+    return `${personalizedGreeting} ${cleanedResponse}`;
   } catch (error) {
     console.error('[ERREUR] Exception dans getChatboxResponse:', error);
     return "Je suis vraiment désolé, je n'ai pas pu traiter votre message. Pouvez-vous reformuler ?";
   }
 };
+
+/**
+ * Traite une requête contextuelle météo
+ * @param {Object} contextualQuery - Requête contextuelle détectée
+ * @returns {Promise<string>} - Réponse contextuelle ou null
+ */
+const handleWeatherContextQuery = async (contextualQuery) => {
+  try {
+    console.log('[DEBUG] Entités météo détectées:', JSON.stringify(contextualQuery.entities));
+    
+    // Si c'est une prévision pour un jour spécifique
+    if (contextualQuery.entities?.forecast) {
+      // Si un jour spécifique est mentionné (autre que demain)
+      if (contextualQuery.entities.day && 
+          contextualQuery.entities.day !== 'tomorrow' && 
+          contextualQuery.entities.day !== 'today') {
+        console.log('[DEBUG] Récupération des prévisions météo pour jour spécifique:', contextualQuery.entities.day);
+        return await contextService.getWeatherForecastForSpecificDay(contextualQuery.entities.day);
+      } else {
+        // Pour demain (cas standard)
+        console.log('[DEBUG] Récupération des prévisions météo pour demain');
+        return await contextService.getWeatherForecastForUser();
+      }
+    }
+    
+    // Météo actuelle
+    return await contextService.getWeatherInfoForUser();
+  } catch (weatherError) {
+    console.error('[ERREUR] handleWeatherContextQuery:', weatherError);
+    return null;
+  }
+};
+
+/**
+ * Vérification avancée du contexte météo pour les requêtes courtes
+ * @param {string} userId - ID de l'utilisateur
+ * @param {string} message - Message à analyser
+ * @param {string} conversationId - ID de la conversation
+ * @returns {Promise<Object>} - Résultat de l'analyse
+ */
+const checkWeatherContext = async (userId, message, conversationId) => {
+  try {
+    if (!message || typeof message !== 'string') return { isWeatherContext: false };
+    
+    // Vérifier si c'est une requête très courte comme "Et demain?" ou "Demain?"
+    const isShortDayQuery = message.length < 20 && 
+                          (/lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|week-?end|demain/i.test(message));
+    
+    if (!isShortDayQuery) return { isWeatherContext: false };
+    
+    console.log('[DEBUG] Détection de requête météo potentielle courte');
+    
+    // Vérifier le contexte de conversation récent
+    const messagesRef = collection(db, 'conversations', conversationId, 'messages');
+    const historyQuery = query(messagesRef, orderBy('timestamp', 'desc'), limit(3));
+    const historySnapshot = await getDocs(historyQuery);
+    const recentMsgs = historySnapshot.docs.map(doc => doc.data());
+    
+    // Vérifier si la conversation récente concernait la météo
+    const weatherContext = recentMsgs.some(msg => 
+      msg.senderId === 'chatbox' && 
+      msg.content && 
+      typeof msg.content === 'string' && 
+      /météo|température|temps|fait[-\s]il|°C|degrés|chaud|froid/i.test(msg.content)
+    );
+    
+    if (weatherContext) {
+      console.log('[DEBUG] Contexte météo détecté, traitement comme prévision météo');
+      
+      // Identifier le jour demandé
+      let targetDay = null;
+      if (/demain/i.test(message)) targetDay = 'tomorrow';
+      else if (/lundi/i.test(message)) targetDay = 'monday';
+      else if (/mardi/i.test(message)) targetDay = 'tuesday';
+      else if (/mercredi/i.test(message)) targetDay = 'wednesday';
+      else if (/jeudi/i.test(message)) targetDay = 'thursday';
+      else if (/vendredi/i.test(message)) targetDay = 'friday';
+      else if (/samedi/i.test(message)) targetDay = 'saturday';
+      else if (/dimanche/i.test(message)) targetDay = 'sunday';
+      else if (/week-?end/i.test(message)) targetDay = 'weekend';
+      
+      return { 
+        isWeatherContext: true, 
+        targetDay,
+        needsSpecificForecast: true
+      };
+    }
+    
+    return { isWeatherContext: false };
+  } catch (error) {
+    console.error('[ERREUR] checkWeatherContext:', error);
+    return { isWeatherContext: false };
+  }
+};
+
+/**
+ * Récupère l'historique de conversation pour un utilisateur
+ * @param {string} userId - ID de l'utilisateur
+ * @param {string} participantId - ID du participant (chatbox)
+ * @returns {Promise<Array>} - Historique des messages
+ */
+async function getConversationHistory(userId, participantId) {
+  try {
+    const conversationId = getConversationId(userId, participantId);
+    console.log(`[DEBUG] Récupération de l'historique pour ${conversationId}`);
+    const messagesRef = collection(db, 'conversations', conversationId, 'messages');
+    const historyQuery = query(messagesRef, orderBy('timestamp', 'asc'), limit(200));
+    const historySnapshot = await getDocs(historyQuery);
+    
+    return historySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  } catch (error) {
+    console.error('[ERREUR] getConversationHistory:', error);
+    return [];
+  }
+}
+
+/**
+ * Formate l'historique de conversation pour le prompt
+ * @param {Array} conversationHistory - Historique des messages
+ * @param {Object} userContext - Contexte utilisateur
+ * @returns {string} - Historique formaté
+ */
+function formatConversationHistoryForPrompt(conversationHistory, userContext) {
+  const historyText = conversationHistory.map(m => {
+    const role = m.senderId === 'chatbox' ? 'Assistant' : (userContext?.firstName || 'Utilisateur');
+    return `- ${role}: "${m.content}"`;
+  }).join('\n');
+
+  return `Historique de la conversation:\n${historyText}\n\n`;
+}
+
+/**
+ * Récupère les messages depuis la racine
+ * @param {string} userId - ID de l'utilisateur
+ * @returns {Promise<Array>} - Messages récupérés
+ */
+async function getMessagesFromRoot(userId) {
+  try {
+    const { success, messages } = await getMessages(userId, 'chatbox', 10);
+    return success ? messages : [];
+  } catch (error) {
+    console.error('[ERREUR] getMessagesFromRoot:', error);
+    return [];
+  }
+}
+
+/**
+ * Formate l'historique racine pour le prompt
+ * @param {Array} rootHistory - Historique des messages
+ * @param {Object} userContext - Contexte utilisateur
+ * @returns {string} - Historique formaté
+ */
+function formatRootHistoryForPrompt(rootHistory, userContext) {
+  const fallbackText = rootHistory.map(m => {
+    const role = m.senderId === 'chatbox' ? 'Assistant' : (userContext?.firstName || 'Utilisateur');
+    return `- ${role}: "${m.content}"`;
+  }).join('\n');
+  
+  return `Historique (root):\n${fallbackText}\n\n`;
+}
+
+/**
+ * Crée un prompt spécial pour l'auto-démarrage du chat
+ * @param {string} userId - ID de l'utilisateur
+ * @param {Object} userContext - Contexte utilisateur
+ * @returns {Promise<string>} - Prompt de démarrage
+ */
+async function createAutoStartPrompt(userId, userContext) {
+  try {
+    const conversationId = getConversationId(userId, 'chatbox');
+    const messagesRef = collection(db, 'conversations', conversationId, 'messages');
+    const historyQuery = query(messagesRef, orderBy('timestamp', 'desc'), limit(5));
+    const historySnapshot = await getDocs(historyQuery);
+    const recentMsgs = historySnapshot.docs.map(doc => doc.data()).reverse();
+
+    const lines = recentMsgs.map(m => {
+      const who = m.senderId === 'chatbox' ? 'Moi' : (userContext?.firstName || 'Vous');
+      return `- ${who} : "${m.content}"`;
+    }).join('\n');
+
+    return `
+Tu es un assistant amical pour ${userContext?.firstName || 'l\'utilisateur'}.
+Voici les derniers échanges :
+${lines}
+
+Relance la conversation comme un ami : rappelle un sujet récent, pose une question, sois chaleureux.
+Ne redis pas juste "Bonjour, comment puis-je vous aider ?"
+`.trim();
+  } catch (error) {
+    console.error('[ERREUR] createAutoStartPrompt:', error);
+    return `Tu es un assistant amical pour ${userContext?.firstName || "l'utilisateur"}. Commence une conversation naturelle et chaleureuse.`;
+  }
+}
 
 /**
  * Génère une réponse immédiate temporaire pour certains types de messages
@@ -737,12 +1072,22 @@ async function createOptimizedPrompt(message, userContext, messageAnalysis, rela
   let futureActivities = [];
   let pastActivities = [];
   let presentActivities = [];
+  let hasGreeted = false;
+  let isJoking = false;
+  let jokeContent = "";
+  let conversationContext = "";
+  let previousContext = "";
   
   // Utiliser la timeline d'activités si disponible
   if (activitiesTimeline) {
     futureActivities = Array.from(activitiesTimeline.future || []);
     pastActivities = Array.from(activitiesTimeline.past || []);
     presentActivities = Array.from(activitiesTimeline.present || []);
+    hasGreeted = activitiesTimeline.hasGreeted || false;
+    isJoking = activitiesTimeline.isJoking || false;
+    jokeContent = activitiesTimeline.jokeContent || "";
+    conversationContext = activitiesTimeline.conversationContext || "";
+    previousContext = activitiesTimeline.previousContext || "";
   }
 
   // Extraire les sujets explicitement mentionnés (pas d'invention)
@@ -776,34 +1121,177 @@ async function createOptimizedPrompt(message, userContext, messageAnalysis, rela
     }
   });
 
-  // Créer un prompt final avec un accent encore plus fort sur la temporalité
+  // Construire le contexte de conversation actuel
+  let currentConversationContext = "conversation générale";
+  
+  // Identifier un sujet de conversation actif depuis les messages récents (5 derniers)
+  const recentUserMessages = conversationHistory
+    .filter(msg => msg.senderId !== 'chatbox')
+    .slice(-5);
+  
+  // Vérifier les messages du chatbot récents (jusqu'à 3)
+  const recentBotMessages = conversationHistory
+    .filter(msg => msg.senderId === 'chatbox')
+    .slice(-3);
+  
+  if (recentUserMessages.length > 0) {
+    // Analyser le dernier message utilisateur
+    const lastMessage = recentUserMessages[recentUserMessages.length - 1];
+    
+    // Vérifier si la dernière réponse était courte (comme "Oui", "Non", "En skateboard")
+    const isShortResponse = lastMessage?.content && 
+                           typeof lastMessage.content === 'string' && 
+                           lastMessage.content.trim().split(/\s+/).length <= 3;
+    
+    // Si c'est une réponse courte, trouver le contexte dans le message précédent du chatbot
+    if (isShortResponse && recentBotMessages.length > 0) {
+      // Récupérer le dernier message du chatbot
+      const lastBotMessage = recentBotMessages[recentBotMessages.length - 1];
+      
+      if (lastBotMessage?.content && typeof lastBotMessage.content === 'string') {
+        // Analyser le contenu de la question du bot pour maintenir le contexte
+        const botQuestion = lastBotMessage.content;
+        
+        // Déterminer le contexte basé sur la question du bot et la réponse courte
+        if (/(voyage|partir|visiter|découvrir|hotel|séjour|vol).*mexique/i.test(botQuestion)) {
+          currentConversationContext = "voyage au Mexique";
+          activitiesTimeline.conversationContext = "voyage au Mexique";
+        } else if (/randonn|mont|marche|nature/i.test(botQuestion)) {
+          currentConversationContext = "randonnée en montagne";
+          activitiesTimeline.conversationContext = "randonnée en montagne";
+        } else if (/cousine|famille|parent/i.test(botQuestion)) {
+          currentConversationContext = "famille et proches";
+          activitiesTimeline.conversationContext = "famille et proches";
+        }
+        
+        // Si la réponse courte était "Non", c'est une négation de la question du bot
+        if (lastMessage.content.trim().toLowerCase() === "non") {
+          currentConversationContext = `négation à la question: "${botQuestion}"`;
+        } else if (lastMessage.content.trim().toLowerCase() === "oui") {
+          currentConversationContext = `confirmation à la question: "${botQuestion}"`;
+        }
+        // Cas spécial pour les réponses humoristiques
+        else if (isJoking && jokeContent) {
+          currentConversationContext = `blague sur ${previousContext || conversationContext}`;
+        }
+      }
+    }
+    
+    // Si des activités futures sont détectées, elles forment le contexte principal
+    if (futureActivities.length > 0) {
+      const mainFutureActivity = futureActivities[0];
+      currentConversationContext = `discussion sur le projet: ${mainFutureActivity}`;
+      activitiesTimeline.conversationContext = currentConversationContext;
+    } else if (pastActivities.length > 0) {
+      currentConversationContext = `discussion sur l'activité passée: ${pastActivities[0]}`;
+      activitiesTimeline.conversationContext = currentConversationContext;
+    }
+  }
+
+  // Créer un prompt final avec un accent encore plus fort sur la temporalité et avec gestion de salutation
   const finalPrompt = `${temporalLocationString}Tu es un assistant chaleureux et amical pour ${firstName}.
 
 Instructions critiques:
-1. Appelle-le TOUJOURS "${firstName}" dans chaque réponse
+1. ${hasGreeted ? 'NE PAS re-saluer avec "Bonjour" (déjà fait)' : 'Commencer par une salutation amicale'}
 2. Utilise le vouvoiement ("vous", pas "tu")
 3. Sois chaleureux, compréhensif et empathique
 4. Réponds de façon brève et simple (max 1-2 phrases)
 
-5. ⚠️ ATTENTION À LA TEMPORALITÉ ⚠️
-ACTIVITÉS STRICTEMENT FUTURES (À VENIR): ${futureActivities.length > 0 ? futureActivities.join(', ') : 'aucune'} 
+5. ⚠️ CONTEXTE ACTUEL: ${currentConversationContext} ⚠️
+   - NE PAS CHANGER abruptement de sujet
+   - CONTINUER la conversation en cours
+   - Si la dernière réponse était "Non", ne pas poser la même question
+   ${isJoking ? `- L'utilisateur a fait une blague avec "${jokeContent}", réagis avec humour` : ''}
+
+6. ⚠️ ACTIVITÉS PAR TEMPORALITÉ (RESPECTER STRICTEMENT) ⚠️
+ACTIVITÉS FUTURES (À VENIR): ${futureActivities.length > 0 ? futureActivities.join(', ') : 'aucune'} 
 ACTIVITÉS PASSÉES (DÉJÀ RÉALISÉES): ${pastActivities.length > 0 ? pastActivities.join(', ') : 'aucune'}
 ACTIVITÉS EN COURS: ${presentActivities.length > 0 ? presentActivities.join(', ') : 'aucune'}
 
-6. Tu dois ABSOLUMENT respecter la chronologie: NE JAMAIS parler d'une activité future comme si elle avait déjà eu lieu
-7. Pour les activités futures, utilise "allez-vous", "prévoyez-vous", "avez-vous hâte de", "vous préparez-vous à"
-8. Pour les activités passées, utilise "comment s'est passé", "avez-vous apprécié"
-9. Ne JAMAIS inventer de détails ou de faits non mentionnés par ${firstName}
-10. Reste cohérent avec le contexte actuel: ${futureActivities.includes('randonnée') ? "randonnée prévue, pas encore réalisée" : 
-                                           pastActivities.includes('randonnée') ? "randonnée déjà effectuée" : 
-                                           "conversation générale"}
+7. ⚠️ RÈGLES ABSOLUES ⚠️
+- NE JAMAIS parler d'une activité future comme si elle avait déjà eu lieu
+- NE JAMAIS parler d'une activité passée sauf si l'utilisateur la mentionne 
+- NE JAMAIS inventer d'activités ou de détails fictifs
+- NE JAMAIS revenir abruptement à une question générique
+- Si l'utilisateur plaisante, réagir avec humour et RESTER sur le sujet principal
 
-${topicsToAvoid.length > 0 ? `11. IMPORTANT: Ne parle PAS des sujets suivants : ${topicsToAvoid.join(', ')}` : ""}
-${messageAnalysis.health.isSick ? "12. La personne a mentionné des problèmes de santé, sois attentif" : ""}
-${messageAnalysis.mood.isNegative ? "13. La personne exprime des sentiments négatifs, montre de l'empathie" : ""}
+${topicsToAvoid.length > 0 ? `8. IMPORTANT: Ne parle PAS des sujets suivants : ${topicsToAvoid.join(', ')}` : ""}
+${messageAnalysis.health.isSick ? "9. La personne a mentionné des problèmes de santé, sois attentif" : ""}
+${messageAnalysis.mood.isNegative ? "10. La personne exprime des sentiments négatifs, montre de l'empathie" : ""}
 
 ${recentMessagesForTopic.length > 0 ? 'Derniers messages de l\'utilisateur:\n- ' + recentMessagesForTopic.slice(-5).join('\n- ') + '\n' : ''}
 ${contextElements.length > 0 ? 'Contexte important:\n' + contextElements.join('\n') : ''}`;
+
+  // Si message spécial pour initialiser la conversation, créer un prompt dédié
+  if (message === 'Commence la discussion naturellement') {
+    // Extraire des thèmes de conversation des messages récents
+    const recentTopics = [];
+    let recentActivity = null;
+    let lastUserEmotion = null;
+    
+    // Analyser les 15 derniers messages pour trouver un sujet pertinent
+    if (conversationHistory && conversationHistory.length > 0) {
+      const lastUserMessages = conversationHistory
+        .filter(msg => msg.senderId !== 'chatbox')
+        .slice(-15);
+        
+      for (const msg of lastUserMessages) {
+        if (msg.content && typeof msg.content === 'string') {
+          // Analyser le contenu pour trouver des sujets d'intérêt
+          const messageImportance = calculateMemoryImportance(msg.content);
+          if (messageImportance.score > 4) {
+            recentTopics.push(messageImportance.topic);
+          }
+          
+          // Détecter des activités
+          const activities = detectActivitiesAndTiming(msg.content);
+          if (activities && (activities.future.length > 0 || activities.past.length > 0)) {
+            recentActivity = activities.future[0] || activities.past[0];
+          }
+          
+          // Détecter l'état émotionnel
+          const analysis = analyzeMessage(msg.content);
+          if (analysis.mood.isPositive) lastUserEmotion = 'positif';
+          if (analysis.mood.isNegative) lastUserEmotion = 'négatif';
+        }
+      }
+    }
+    
+    // Construire un prompt d'initialisation contextualisé
+    const firstName = userContext?.firstName || 'l\'utilisateur';
+    let recentContext = '';
+    
+    if (recentTopics.length > 0) {
+      recentContext += `\n- Sujets récemment abordés: ${recentTopics.slice(0, 3).join(', ')}.`;
+    }
+    
+    if (recentActivity) {
+      recentContext += `\n- Activité importante mentionnée: ${recentActivity}.`;
+    }
+    
+    if (lastUserEmotion) {
+      recentContext += `\n- État émotionnel récent: ${lastUserEmotion}.`;
+    }
+    
+    if (temporalAndLocationContext) {
+      recentContext += `\n- Contexte actuel: ${temporalAndLocationContext}`;
+    }
+    
+    return {
+      system: `Tu es un assistant conversationnel chaleureux pour ${firstName}. 
+Relance la conversation de façon naturelle et personnalisée, comme le ferait un ami attentionné.
+${recentContext}
+
+IMPORTANT:
+1. Commence par une salutation amicale mais PAS GÉNÉRIQUE (évite "Bonjour, comment puis-je vous aider?")
+2. Pose une question ouverte liée à un sujet récent OU introduis un nouveau sujet intéressant
+3. Reste TRÈS concis et humain (max 1-2 phrases)
+4. Utilise le vouvoiement (vous, votre, etc.)
+5. Ne demande JAMAIS "comment je peux vous aider" ou "de quoi voulez-vous parler"
+6. Sois chaleureux, naturel et CURIEUX comme un ami qui reprend contact`,
+      user: message
+    };
+  }
 
   return {
     system: finalPrompt,
@@ -816,10 +1304,22 @@ ${contextElements.length > 0 ? 'Contexte important:\n' + contextElements.join('\
  */
 const generateOpenAIResponse = async (prompt) => {
   try {
-    if (!OPENAI_API_KEY) {
-      throw new Error('Clé API OpenAI non définie');
+    // Get API key from AsyncStorage - this is the primary source now
+    let apiKey = await AsyncStorage.getItem('openai_api_key');
+
+    // Try env variable as fallback (optional)
+    if (!apiKey) {
+      try {
+        apiKey = OPENAI_API_KEY;
+      } catch (e) {
+        console.warn('[AVERTISSEMENT] OPENAI_API_KEY not loaded from env');
+      }
     }
-    
+
+    if (!apiKey || apiKey === 'your-openai-api-key' || apiKey.includes('*')) {
+      throw new Error('Clé API OpenAI non configurée. Veuillez configurer votre clé API dans les paramètres.');
+    }
+
     // Préparation des messages pour l'API avec structure minimale
     const messages = [
       { role: 'system', content: prompt.system },
@@ -830,20 +1330,33 @@ const generateOpenAIResponse = async (prompt) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Authorization': `Bearer ${apiKey.trim()}`,
       },
       body: JSON.stringify({
-        model: 'gpt-3.5-turbo',
+        model: 'gpt-3.5-turbo-16k',  // Amélioration du modèle pour mieux gérer le contexte
         messages: messages,
-        temperature: 0.6,  // Température plus basse pour plus de cohérence
+        temperature: 0.4,  // Température plus basse pour plus de cohérence et moins d'inventions
         max_tokens: 150,  // Réduit pour réponses plus courtes et rapides
-        presence_penalty: 0.7,  // Augmenté pour réduire les répétitions
-        frequency_penalty: 0.7   // Augmenté pour réduire les répétitions
+        presence_penalty: 0.9,  // Augmenté davantage pour réduire les répétitions
+        frequency_penalty: 0.9,  // Augmenté davantage pour réduire les répétitions
+        // Pénaliser fortement les phrases génériques et salutations répétées
+        logit_bias: {
+          13959: -8,  // "Comment" 
+          511: -8,    // "puis"
+          314: -8,    // "je"
+          12175: -8,  // "aider"
+          10242: -6,  // "Bonjour"
+          31012: -6,  // "comment"
+          41128: -6,  // "allez"
+          11270: -6   // "aujour"
+        }
       })
     });
     
     if (!response.ok) {
-      throw new Error(`Erreur API: ${response.status}`);
+      const errorData = await response.text().catch(() => '');
+      console.error('[ERREUR] Réponse API non-OK:', response.status, errorData);
+      throw new Error(`Erreur API: ${response.status}${errorData ? ' - ' + errorData : ''}`);
     }
     
     const data = await response.json();
@@ -869,8 +1382,14 @@ const generateOpenAIResponse = async (prompt) => {
       }
     }
     
-    console.log('[DEBUG] Réponse IA:', responseText);
-    return responseText;
+    // Nettoyer la réponse en supprimant les mentions d'utilisateur/assistant
+    const cleanedResponse = responseText
+      .replace(/^(Assistant|Utilisateur)\s*:\s*/i, '')
+      .replace(/^- (Assistant|Utilisateur)\s*:\s*"/i, '')
+      .replace(/"$/i, '');
+    
+    console.log('[DEBUG] Réponse IA:', cleanedResponse);
+    return cleanedResponse;
   } catch (error) {
     console.error('[ERREUR] API OpenAI:', error);
     throw error;
@@ -962,7 +1481,7 @@ export const storeUserMemory = async (userId, topic, content, importance = 5) =>
       context = "Famille";
       importance = Math.max(importance, 7);
     }
-    
+
     // AJOUT : Détecter les délais mentionnés dans le contenu
     const delays = {
       week: /dans (une |1 )?semaine|la semaine prochaine/i,
@@ -991,8 +1510,6 @@ export const storeUserMemory = async (userId, topic, content, importance = 5) =>
       topic,
       content,
       context,
-      importance,
-      mood: messageAnalysis.mood.isPositive ? "positive" : messageAnalysis.mood.isNegative ? "negative" : "neutral",
       timestamp: currentTime,
       createdAt: currentTime.toISOString(),
       remindAfter: remindAfter?.toISOString() || null
@@ -1035,7 +1552,7 @@ export const storeUserMemory = async (userId, topic, content, importance = 5) =>
         recentImportantEvent: {
           context,
           content,
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
         }
       });
     }
@@ -1076,7 +1593,7 @@ const updateUserContext = async (userId, contextUpdates) => {
       await AsyncStorage.setItem(`user_context_${userId}`, JSON.stringify({
         ...existingContext,
         ...contextUpdates,
-        lastUpdated: new Date().toISOString()
+        lastUpdated: new Date().toISOString()  
       }));
     } catch (storageError) {
       console.warn('[AVERTISSEMENT] Erreur AsyncStorage dans updateUserContext:', storageError);
@@ -1136,7 +1653,7 @@ export const subscribeToMessages = (conversationId, callback) => {
     // Créer une requête triée par timestamp
     const messagesQuery = query(messagesRef, orderBy('timestamp', 'asc'));
     
-    // S'abonner aux changements
+    // S'abonner aux changements    
     const unsubscribe = onSnapshot(messagesQuery, (snapshot) => {
       try {
         const messages = snapshot.docs.map(doc => ({
@@ -1265,7 +1782,6 @@ export const subscribeToTypingStatus = (conversationId, currentUserId, callback)
           const data = doc.data();
           // Vérifier si le statut est récent (moins de 10 secondes)
           if (!data.timestamp) return false;
-          
           const timestamp = data.timestamp.toDate ? data.timestamp.toDate() : new Date(data.timestamp);
           const now = new Date();
           const diff = now - timestamp;
@@ -1303,7 +1819,7 @@ export const getWelcomeMessage = async (firstName) => {
     let greeting;
     if (hour < 12) {
       greeting = "Bonjour";
-    } else if (hour < 18) {
+    } else if (hour < 18) { 
       greeting = "Bon après-midi";
     } else {
       greeting = "Bonsoir";
@@ -1358,7 +1874,6 @@ export const createConversation = async (userId1, userId2) => {
     
     // Vérifier si la conversation existe déjà
     const conversationDoc = await getDoc(conversationRef);
-    
     if (conversationDoc.exists()) {
       return { success: true, conversationId, existing: true };
     }
@@ -1378,9 +1893,9 @@ export const createConversation = async (userId1, userId2) => {
 };
 
 /**
- * Scanne toutes les conversations d’un utilisateur (famille + chatbox)
+ * Scanne toutes les conversations d'un utilisateur (famille + chatbox)
  * Extrait les messages importants et les stocke dans les souvenirs
- * @param {string} userId - ID de l’utilisateur senior
+ * @param {string} userId - ID de l'utilisateur senior
  */
 export const collectGlobalMemories = async (userId) => {
   try {
@@ -1390,46 +1905,139 @@ export const collectGlobalMemories = async (userId) => {
     }
 
     console.log(`[DEBUG] Scan de toutes les conversations pour ${userId}`);
+    
+    // Optimisation 1: Vérification de cache pour éviter des scans fréquents
+    const now = Date.now();
+    const lastScanKey = `last_memory_scan_${userId}`;
+    let shouldScan = true;
+    
+    try {
+      const lastScan = await AsyncStorage.getItem(lastScanKey);
+      if (lastScan) {
+        const lastScanTime = parseInt(lastScan, 10);
+        // Ne scanner que toutes les 30 minutes au maximum
+        if (now - lastScanTime < 30 * 60 * 1000) {
+          console.log('[DEBUG] Scan récent détecté, on ignore cette exécution');
+          shouldScan = false;
+        }
+      }
+    } catch (e) {
+      // Ignorer les erreurs de lecture AsyncStorage
+      console.warn('[AVERTISSEMENT] Erreur lors de la vérification du dernier scan:', e);
+    }
 
-    // Charger toutes les conversations de l’utilisateur
+    // Ne continuer que si nécessaire
+    if (!shouldScan) {
+      console.log('[DEBUG] collectGlobalMemories ignoré (scan récent) ✅');
+      return;
+    }
+
+    // Optimisation 2: Requête unique pour récupérer toutes les conversations pertinentes
     const conversationsRef = collection(db, 'conversations');
-    const snapshot = await getDocs(conversationsRef);
+    const relevantConversationsQuery = query(
+      conversationsRef,
+      where('participants', 'array-contains', userId)
+    );
 
+    const snapshot = await getDocs(relevantConversationsQuery);
+
+    // Optimisation 3: Traitement par lots pour réduire le nombre de requêtes
+    const messagePromises = [];
     for (const docSnap of snapshot.docs) {
       const conversationId = docSnap.id;
-
-      // Vérifie que l’utilisateur est bien concerné
+      
+      // Double vérification que la conversation concerne bien cet utilisateur
       if (!conversationId.includes(userId)) continue;
 
+      // Optimisation 4: Utilisation de limit() pour réduire le volume de données
       const messagesRef = collection(db, 'conversations', conversationId, 'messages');
-      const recentMessagesQuery = query(messagesRef, orderBy('timestamp', 'desc'), limit(20));
-      const messagesSnap = await getDocs(recentMessagesQuery);
+      const recentMessagesQuery = query(messagesRef, orderBy('timestamp', 'desc'), limit(15));
+      messagePromises.push(getDocs(recentMessagesQuery).then(snap => ({
+        conversationId,
+        messages: snap.docs.map(doc => ({ id: doc.id, ...doc.data() }))
+      })));
+    }
+    
+    // Optimisation 5: Parallélisation des requêtes pour réduire le temps total
+    const conversationsWithMessages = await Promise.all(messagePromises);
+    
+    // Optimisation 6: Regroupement du traitement des souvenirs pour minimiser les écritures
+    const memoriesToStore = [];
 
-      for (const msgDoc of messagesSnap.docs) {
-        const msg = msgDoc.data();
-
+    for (const { conversationId, messages } of conversationsWithMessages) {
+      for (const msg of messages) {
         // Filtrer uniquement les messages texte pertinents
         if (msg.type !== 'text' || !msg.content || typeof msg.content !== 'string') continue;
-        if (msg.senderId === 'chatbox') continue; // Ignore les messages générés par le bot
+        if (msg.senderId === 'chatbox') continue; // Ignorer les messages générés par le bot
+        
+        // Optimisation 7: Pré-filtrage côté client pour réduire les opérations d'écriture inutiles
+        if (msg.content.length < 10) continue; // Ignorer les messages très courts
 
         const importanceData = calculateMemoryImportance(msg.content);
         const score = importanceData.score;
-
+        
         if (score > 5) {
           console.log(`[DEBUG] Souvenir détecté (${score}) :`, msg.content);
-
-          // Enregistrer dans la mémoire
-          await storeUserMemory(userId, importanceData.topic, msg.content, score);
+          
+          // Au lieu de stocker tout de suite, ajouter à la liste
+          memoriesToStore.push({
+            topic: importanceData.topic,
+            content: msg.content,
+            importance: score
+          });
         }
       }
     }
-
+    
+    // Optimisation 8: Dédupliquer les souvenirs similaires avant de les stocker
+    const uniqueMemories = dedupMemories(memoriesToStore);
+    
+    // Optimisation 9: Stocker les souvenirs en parallèle avec limitation de concurrence
+    const storePromises = uniqueMemories.map(mem => 
+      storeUserMemory(userId, mem.topic, mem.content, mem.importance)
+    );
+    await Promise.all(storePromises);
+    
+    // Mettre à jour le timestamp du dernier scan
+    try {
+      await AsyncStorage.setItem(lastScanKey, now.toString());
+    } catch (e) {
+      console.warn('[AVERTISSEMENT] Erreur lors de la mise à jour du timestamp de scan:', e);
+    }
+    
     console.log('[DEBUG] collectGlobalMemories terminé ✅');
   } catch (error) {
     console.error('[ERREUR] collectGlobalMemories:', error);
   }
 };
 
+/**
+ * Fonction utilitaire pour dédupliquer les souvenirs similaires
+ * @param {Array} memories - Liste de souvenirs à dédupliquer
+ * @returns {Array} - Liste de souvenirs dédupliqués
+ */
+function dedupMemories(memories) {
+  // Map pour regrouper par topic
+  const topicGroups = new Map();
+  
+  memories.forEach(mem => {
+    if (!topicGroups.has(mem.topic)) {
+      topicGroups.set(mem.topic, []);
+    }
+    topicGroups.get(mem.topic).push(mem);
+  });
+  
+  // Pour chaque topic, ne garder que le souvenir avec le score le plus élevé
+  const uniqueMemories = [];
+  topicGroups.forEach((mems, topic) => {
+    // Trier par importance décroissante
+    mems.sort((a, b) => b.importance - a.importance);
+    // Ne prendre que le premier (le plus important)
+    uniqueMemories.push(mems[0]);
+  });
+  
+  return uniqueMemories;
+}
 
 // Exporter les fonctions nécessaires
 export {

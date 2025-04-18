@@ -30,6 +30,7 @@
     "web": {
       "favicon": "./assets/images/favicon.png"
     },
+    "scheme": "papote",
     "plugins": [
       [
         "expo-image-picker",
